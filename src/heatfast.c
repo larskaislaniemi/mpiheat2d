@@ -4,6 +4,7 @@
 #include <math.h>
 #include <hdf5.h>
 #include <libconfig.h>
+#include <string.h>
 
 #define IY 0
 #define IX 1
@@ -13,24 +14,17 @@
 #define ERR_CMDLINE_ARGUMENT 4
 #define ERR_FILEOPER 8
 #define ERR_CFGFILE 16
+#define ERR_INTERNAL 65536
+
+#define STR_MAXLEN 255
 
 typedef double Real;               // NB! libconfig currently support double, not float
 #define C_MPI_REAL MPI_DOUBLE
 #define C_H5_REAL H5T_NATIVE_DOUBLE
 
-struct config {
-	int nx, ny, px, py;   // num of grid points; num of procs
-	Real Lx, Ly;        // physical dimensions
-	Real Kdiff;         // heatdiffusivity
-	Real dt;            // time step
-	int niter;            // num of iters
-};
 
-struct field {
-	Real *f;
-	int nx, ny;
-	int ox, oy;
-};
+
+/* MPIDATA and related routines */
 
 struct mpidata {
 	MPI_Comm comm2d;
@@ -40,6 +34,18 @@ struct mpidata {
 	int mpicomm_dims[2];
 	int mpicoord[2];
 	int rank_neighb[4];
+};
+
+
+
+/* CONFIG and related routines */
+
+struct config {
+	int nx, ny, px, py;   // num of grid points; num of procs
+	Real Lx, Ly;          // physical dimensions
+	Real Kdiff;           // heatdiffusivity
+	Real dt;              // time step
+	int niter;            // num of iters
 };
 
 void createMPIDatatypeConfig(struct config *c, MPI_Datatype *newtype) {
@@ -74,7 +80,18 @@ void createMPIDatatypeConfig(struct config *c, MPI_Datatype *newtype) {
 	MPI_Type_create_struct(configStructLen, configBlockLens, configDisplacements, configDatatypes, newtype);
 }
 
+
+/* FIELD and related routines */
+
+struct field {
+	Real *f;               // field values
+	char name[STR_MAXLEN]; // name of the field
+	int nx, ny;            // size of the field (grid points)
+	int ox, oy;            // origin of the field relative to the global grid origin
+};
+
 void createFromField(struct field const *const f1, struct field *const f2) {
+	strncpy(f2->name, f1->name, STR_MAXLEN);
 	f2->nx = f1->nx; f2->ny = f1->ny;
 	f2->ox = f1->ox; f2->oy = f1->oy;
 	f2->f = malloc(sizeof(Real) * f2->nx * f2->ny);
@@ -92,12 +109,17 @@ Real gen_field_T(Real y, Real x) {
 void swapFields(struct field *const a, struct field *const b) {
 	Real *tmp;
 	int tmpox, tmpoy;
+	char tmpname[STR_MAXLEN];
 
 	if (a->nx != b->nx || a->ny != b->ny) {
 		fprintf(stderr, "cannot swap fields of different sizes\n");
 		MPI_Abort(MPI_COMM_WORLD, ERR_SIZE_MISMATCH);
 		exit(ERR_SIZE_MISMATCH);
 	}
+
+	strncpy(tmpname, a->name, STR_MAXLEN);
+	strncpy(a->name, b->name, STR_MAXLEN);
+	strncpy(b->name, tmpname, STR_MAXLEN);
 
 	tmp = a->f;
 	a->f = b->f;
@@ -110,6 +132,137 @@ void swapFields(struct field *const a, struct field *const b) {
 	b->ox = tmpox;
 	b->oy = tmpoy;
 }
+
+int nameField(struct field *f, char *name) {
+	int hasNull = 0;
+
+
+	for (int i = 0; i < STR_MAXLEN; i++) {
+		if (name[i] == '\0') {
+			hasNull = 1;
+			break;
+		}
+	}
+
+	if (hasNull) strncpy(f->name, name, STR_MAXLEN);
+	else return ERR_INTERNAL;
+
+	return 0;
+}
+
+void writeFields(int nfields, struct field **fields, 
+		struct field *gridy, struct field *gridx, 
+		struct mpidata *mpistate, struct config *globalConfig) {
+	//herr_t status;
+	hid_t plist_id, dset_id, filespace, memspace, file_id;
+	hsize_t dims[2], counts[2], offsets[2];
+	int ny, nx;
+
+	/* create hdf5 file */
+
+	plist_id = H5Pcreate(H5P_FILE_ACCESS);
+	H5Pset_fapl_mpio(plist_id, mpistate->comm2d, MPI_INFO_NULL);
+	file_id = H5Fcreate("data.h5", H5F_ACC_TRUNC, H5P_DEFAULT, plist_id);
+	H5Pclose(plist_id);
+
+	plist_id = H5Pcreate(H5P_DATASET_XFER);
+	H5Pset_dxpl_mpio(plist_id, H5FD_MPIO_COLLECTIVE);
+
+	ny = globalConfig->ny;
+	nx = globalConfig->nx;
+
+
+	/* create datasets */
+
+	for (int ifield = 0; ifield < nfields; ifield++) {
+		/* Create the dataset */
+		dims[0] = ny;
+		dims[1] = nx;
+		filespace = H5Screate_simple(2, dims, NULL);
+		dset_id = H5Dcreate(file_id, fields[ifield]->name, C_H5_REAL, filespace,
+			H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
+		H5Sclose(filespace);
+
+		/* Select a hyperslab of the file dataspace */
+		offsets[0] = fields[ifield]->oy+1; offsets[1] = fields[ifield]->ox+1;
+		counts[0] = fields[ifield]->ny-2; counts[1] = fields[ifield]->nx-2;
+		filespace = H5Dget_space(dset_id);
+		H5Sselect_hyperslab(filespace, H5S_SELECT_SET, offsets, NULL, counts, NULL);
+
+		counts[0] = fields[ifield]->ny; counts[1] = fields[ifield]->nx;
+		memspace = H5Screate_simple(2, counts, NULL);
+		counts[0] = fields[ifield]->ny-2; counts[1] = fields[ifield]->nx-2;
+		offsets[0] = 1; offsets[1] = 1;
+		H5Sselect_hyperslab(memspace, H5S_SELECT_SET, offsets, NULL, counts, NULL);
+
+		H5Dwrite(dset_id, C_H5_REAL, memspace, filespace, plist_id, fields[ifield]->f);  // status =
+
+		H5Dclose(dset_id);
+		H5Sclose(filespace);
+		H5Sclose(memspace);
+	}
+
+	/* datasets for coordinates, Y */
+	dims[0] = ny;
+	filespace = H5Screate_simple(1, dims, NULL);
+	dset_id = H5Dcreate(file_id, "_coord_y", C_H5_REAL, filespace, 
+		H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
+	H5Sclose(filespace);
+
+	offsets[0] = gridy->oy+1; counts[0] = gridy->ny-2;
+	filespace = H5Dget_space(dset_id);
+	H5Sselect_hyperslab(filespace, H5S_SELECT_SET, offsets, NULL, counts, NULL);
+
+	counts[0] = gridy->ny;
+	memspace = H5Screate_simple(1, counts, NULL);
+	counts[0] = gridy->ny-2; offsets[0] = 1;
+	H5Sselect_hyperslab(memspace, H5S_SELECT_SET, offsets, NULL, counts, NULL);
+
+	plist_id = H5Pcreate(H5P_DATASET_XFER);
+	H5Pset_dxpl_mpio(plist_id, H5FD_MPIO_COLLECTIVE);
+
+	H5Dwrite(dset_id, C_H5_REAL, memspace, filespace, plist_id, gridy->f);  // status =
+
+	H5Dclose(dset_id);
+	H5Sclose(filespace);
+	H5Sclose(memspace);
+
+
+	/* datasets for coordinates, X */
+	dims[0] = nx;
+	filespace = H5Screate_simple(1, dims, NULL);
+	dset_id = H5Dcreate(file_id, "_coord_x", C_H5_REAL, filespace, 
+		H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
+	H5Sclose(filespace);
+
+	offsets[0] = gridx->ox+1; counts[0] = gridx->nx-2;
+	filespace = H5Dget_space(dset_id);
+	H5Sselect_hyperslab(filespace, H5S_SELECT_SET, offsets, NULL, counts, NULL);
+
+	counts[0] = gridx->nx;
+	memspace = H5Screate_simple(1, counts, NULL);
+	counts[0] = gridx->nx-2; offsets[0] = 1;
+	H5Sselect_hyperslab(memspace, H5S_SELECT_SET, offsets, NULL, counts, NULL);
+
+	plist_id = H5Pcreate(H5P_DATASET_XFER);
+	H5Pset_dxpl_mpio(plist_id, H5FD_MPIO_COLLECTIVE);
+
+	H5Dwrite(dset_id, C_H5_REAL, memspace, filespace, plist_id, gridx->f); // status = 
+
+	H5Dclose(dset_id);
+	H5Sclose(filespace);
+	H5Sclose(memspace);
+
+
+	/* Close all opened HDF5 handles */
+	H5Pclose(plist_id);
+	H5Fclose(file_id);
+
+}
+
+
+
+/* UTILITIES */
 
 void printDomains(struct mpidata const *const mpistate, struct field const *const fld) {
 	int iproc, nproc;
@@ -132,6 +285,56 @@ void printDomains(struct mpidata const *const mpistate, struct field const *cons
 	}
 }
 
+void readConfig(struct config *globalConfig, const char *configfile) {
+	FILE *cfgfp;
+	int iproc, nproc;
+	config_t inputcfg;
+	MPI_Datatype globalConfigMPIType;
+
+	MPI_Comm_rank(MPI_COMM_WORLD, &iproc);
+	MPI_Comm_size(MPI_COMM_WORLD, &nproc);
+
+	/* read config */
+	if (iproc == 0) {
+
+		cfgfp = fopen(configfile, "r");
+		if (cfgfp == NULL) {
+			fprintf(stderr, "ERROR: open file %s\n", configfile);
+			MPI_Barrier(MPI_COMM_WORLD);
+			MPI_Abort(MPI_COMM_WORLD, ERR_FILEOPER|ERR_CMDLINE_ARGUMENT);
+			exit(ERR_FILEOPER|ERR_CMDLINE_ARGUMENT);
+		}
+		config_init(&inputcfg);
+		config_read(&inputcfg, cfgfp);
+		fclose(cfgfp);
+
+		if (config_lookup_int(&inputcfg, "grid.nx", &globalConfig->nx) != CONFIG_TRUE) { fprintf(stderr, "config option grid.nx needed but not found\n"); MPI_Abort(MPI_COMM_WORLD, ERR_CFGFILE); exit(ERR_CFGFILE); }
+		if (config_lookup_int(&inputcfg, "grid.ny", &globalConfig->ny) != CONFIG_TRUE) { fprintf(stderr, "config option grid.ny needed but not found\n"); MPI_Abort(MPI_COMM_WORLD, ERR_CFGFILE); exit(ERR_CFGFILE); }
+		if (config_lookup_float(&inputcfg, "grid.Lx", &globalConfig->Lx) != CONFIG_TRUE) { fprintf(stderr, "config option grid.Lx needed but not found\n"); MPI_Abort(MPI_COMM_WORLD, ERR_CFGFILE); exit(ERR_CFGFILE); }
+		if (config_lookup_float(&inputcfg, "grid.Ly", &globalConfig->Ly) != CONFIG_TRUE) { fprintf(stderr, "config option grid.Ly needed but not found\n"); MPI_Abort(MPI_COMM_WORLD, ERR_CFGFILE); exit(ERR_CFGFILE); }
+		if (config_lookup_int(&inputcfg, "mpi.px", &globalConfig->px) != CONFIG_TRUE) { fprintf(stderr, "config option mpi.px needed but not found\n"); MPI_Abort(MPI_COMM_WORLD, ERR_CFGFILE); exit(ERR_CFGFILE); }
+		if (config_lookup_int(&inputcfg, "mpi.py", &globalConfig->py) != CONFIG_TRUE) { fprintf(stderr, "config option mpi.py needed but not found\n"); MPI_Abort(MPI_COMM_WORLD, ERR_CFGFILE); exit(ERR_CFGFILE); }
+		if (config_lookup_float(&inputcfg, "phys.kdiff", &globalConfig->Kdiff) != CONFIG_TRUE) { fprintf(stderr, "config option phys.kdiff needed but not found\n"); MPI_Abort(MPI_COMM_WORLD, ERR_CFGFILE); exit(ERR_CFGFILE); }
+		if (config_lookup_int(&inputcfg, "run.iter", &globalConfig->niter) != CONFIG_TRUE) { fprintf(stderr, "config option run.iter needed but not found\n"); MPI_Abort(MPI_COMM_WORLD, ERR_CFGFILE); exit(ERR_CFGFILE); }
+	}
+	createMPIDatatypeConfig(globalConfig, &globalConfigMPIType);
+	MPI_Type_commit(&globalConfigMPIType);
+	if (iproc == 0) {
+		for (int i = 1; i < nproc; i++) {
+			MPI_Send(globalConfig, 1, globalConfigMPIType, i, 0, MPI_COMM_WORLD);
+		}
+	} else {
+		MPI_Recv(globalConfig, 1, globalConfigMPIType, 0, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+	}
+	MPI_Type_free(&globalConfigMPIType);
+	if (iproc == 0) {
+		config_destroy(&inputcfg);
+	}
+}
+
+
+/* MAIN PROGRAM */
+
 int main(int argc, char **argv) {
 	struct mpidata mpistate;
 	mpistate.mpicomm_ndims = 2;
@@ -146,16 +349,11 @@ int main(int argc, char **argv) {
 
 	struct field T, Told;
 	struct field globalGridx, globalGridy, gridx, gridy;
+	struct field **allFields;
 
 	Real dy, dx;
 	MPI_Datatype columntype;
 
-	double time2, time1;
-
-	config_t inputcfg;
-	FILE *cfgfp;
-
-	MPI_Datatype globalConfigMPIType;
 
 	/* inits */
 	MPI_Init(&argc, &argv);
@@ -163,55 +361,16 @@ int main(int argc, char **argv) {
 	MPI_Comm_rank(MPI_COMM_WORLD, &iproc);
 	MPI_Comm_size(MPI_COMM_WORLD, &nproc);
 
-	//fprintf(stdout, "[%d/%d] Hello\n", iproc, nproc);
 
 	/* read config */
-	if (iproc == 0) {
 
-		if (argc != 2) {
-			fprintf(stderr, "ERROR: No config file\nUsage: %s configfile\n", argv[0]);
-			MPI_Abort(MPI_COMM_WORLD, ERR_CMDLINE_ARGUMENT);
-			exit(ERR_CMDLINE_ARGUMENT);
-		}
-
-		cfgfp = fopen(argv[1], "r");
-		if (cfgfp == NULL) {
-			fprintf(stderr, "ERROR: open file %s\n", argv[1]);
-			MPI_Abort(MPI_COMM_WORLD, ERR_FILEOPER|ERR_CMDLINE_ARGUMENT);
-			exit(ERR_FILEOPER|ERR_CMDLINE_ARGUMENT);
-		}
-		config_init(&inputcfg);
-		config_read(&inputcfg, cfgfp);
-		fclose(cfgfp);
-
-		if (config_lookup_int(&inputcfg, "grid.nx", &globalConfig.nx) != CONFIG_TRUE) { fprintf(stderr, "config option grid.nx needed but not found\n"); MPI_Abort(MPI_COMM_WORLD, ERR_CFGFILE); exit(ERR_CFGFILE); }
-		if (config_lookup_int(&inputcfg, "grid.ny", &globalConfig.ny) != CONFIG_TRUE) { fprintf(stderr, "config option grid.ny needed but not found\n"); MPI_Abort(MPI_COMM_WORLD, ERR_CFGFILE); exit(ERR_CFGFILE); }
-		if (config_lookup_float(&inputcfg, "grid.Lx", &globalConfig.Lx) != CONFIG_TRUE) { fprintf(stderr, "config option grid.Lx needed but not found\n"); MPI_Abort(MPI_COMM_WORLD, ERR_CFGFILE); exit(ERR_CFGFILE); }
-		if (config_lookup_float(&inputcfg, "grid.Ly", &globalConfig.Ly) != CONFIG_TRUE) { fprintf(stderr, "config option grid.Ly needed but not found\n"); MPI_Abort(MPI_COMM_WORLD, ERR_CFGFILE); exit(ERR_CFGFILE); }
-		if (config_lookup_int(&inputcfg, "mpi.px", &globalConfig.px) != CONFIG_TRUE) { fprintf(stderr, "config option mpi.px needed but not found\n"); MPI_Abort(MPI_COMM_WORLD, ERR_CFGFILE); exit(ERR_CFGFILE); }
-		if (config_lookup_int(&inputcfg, "mpi.py", &globalConfig.py) != CONFIG_TRUE) { fprintf(stderr, "config option mpi.py needed but not found\n"); MPI_Abort(MPI_COMM_WORLD, ERR_CFGFILE); exit(ERR_CFGFILE); }
-		if (config_lookup_float(&inputcfg, "phys.kdiff", &globalConfig.Kdiff) != CONFIG_TRUE) { fprintf(stderr, "config option phys.kdiff needed but not found\n"); MPI_Abort(MPI_COMM_WORLD, ERR_CFGFILE); exit(ERR_CFGFILE); }
-		if (config_lookup_int(&inputcfg, "run.iter", &globalConfig.niter) != CONFIG_TRUE) { fprintf(stderr, "config option run.iter needed but not found\n"); MPI_Abort(MPI_COMM_WORLD, ERR_CFGFILE); exit(ERR_CFGFILE); }
-	}
-	createMPIDatatypeConfig(&globalConfig, &globalConfigMPIType);
-	MPI_Type_commit(&globalConfigMPIType);
-	if (iproc == 0) {
-		for (int i = 1; i < nproc; i++) {
-			MPI_Send(&globalConfig, 1, globalConfigMPIType, i, 0, MPI_COMM_WORLD);
-		}
-	} else {
-		MPI_Recv(&globalConfig, 1, globalConfigMPIType, 0, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+	if (argc != 2) {
+		fprintf(stderr, "ERROR: No config file\nUsage: %s configfile\n", argv[0]);
+		MPI_Abort(MPI_COMM_WORLD, ERR_CMDLINE_ARGUMENT);
+		exit(ERR_CMDLINE_ARGUMENT);
 	}
 
-/*	globalConfig.nx = 2000;
-	globalConfig.ny = 2000;
-	globalConfig.Lx = 1.0;
-	globalConfig.Ly = 1.0;
-	globalConfig.px = 2;
-	globalConfig.py = 2;
-	globalConfig.Kdiff = 1.0;
-	globalConfig.dt = 0; // dt = dx2 * dy2 / (2.0 * a * (dx2 + dy2));
-	globalConfig.niter = 100;*/
+	readConfig(&globalConfig, argv[1]);
 
 
 	/* find good proc configuration */
@@ -264,6 +423,13 @@ int main(int argc, char **argv) {
 
 	createFromField(&T, &Told);
 
+	nameField(&T, "T");
+	nameField(&Told, "Told");
+
+	allFields = malloc(sizeof(struct field *) * 2);
+	allFields[0] = &T;
+	allFields[1] = &Told;
+
 
 
 	/* setup initial values */
@@ -272,8 +438,6 @@ int main(int argc, char **argv) {
 			T.f[i*gridx.nx + j] = gen_field_T(gridy.f[i], gridx.f[j]);
 		}
 	}
-
-	time1 = MPI_Wtime();
 
 	for (int iter = 0; iter < globalConfig.niter; iter++) {
 		if (iproc == 0) fprintf(stdout, "Iter %d\n", iter);
@@ -343,126 +507,7 @@ int main(int argc, char **argv) {
 
 	}
 
-	time2 = MPI_Wtime();
-	if (iproc == 0) fprintf(stderr, "Iters took %g secs\n", time2-time1);
-
-	//MPI_Barrier(MPI_COMM_WORLD);
-	//printDomains(&mpistate, &T);
-	//printDomains(&mpistate, &gridx);
-	//printDomains(&mpistate, &gridy);
-	//
-	
-
-	/* write data out
-	 */
-	if (iproc == 0) fprintf(stdout, "Output\n");
-	time1 = MPI_Wtime();
-
-	{
-		herr_t status;
-		hid_t plist_id, dset_id, filespace, memspace, file_id;
-		hsize_t dims[2], counts[2], offsets[2];
-
-		plist_id = H5Pcreate(H5P_FILE_ACCESS);
-		H5Pset_fapl_mpio(plist_id, mpistate.comm2d, MPI_INFO_NULL);
-		file_id = H5Fcreate("data.h5", H5F_ACC_TRUNC, H5P_DEFAULT, plist_id);
-		H5Pclose(plist_id);
-
-
-		plist_id = H5Pcreate(H5P_DATASET_XFER);
-		H5Pset_dxpl_mpio(plist_id, H5FD_MPIO_COLLECTIVE);
-
-		/* Create the dataset */
-		dims[0] = globalConfig.ny;
-		dims[1] = globalConfig.nx;
-		filespace = H5Screate_simple(2, dims, NULL);
-		dset_id = H5Dcreate(file_id, "T", C_H5_REAL, filespace,
-			H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
-		H5Sclose(filespace);
-
-		/* Select a hyperslab of the file dataspace */
-		offsets[0] = T.oy+1; offsets[1] = T.ox+1;
-		counts[0] = T.ny-2; counts[1] = T.nx-2;
-		filespace = H5Dget_space(dset_id);
-		H5Sselect_hyperslab(filespace, H5S_SELECT_SET, offsets, NULL, counts, NULL);
-
-		counts[0] = T.ny; counts[1] = T.nx;
-		memspace = H5Screate_simple(2, counts, NULL);
-		counts[0] = T.ny-2; counts[1] = T.nx-2;
-		offsets[0] = 1; offsets[1] = 1;
-		H5Sselect_hyperslab(memspace, H5S_SELECT_SET, offsets, NULL, counts, NULL);
-
-		status = H5Dwrite(dset_id, C_H5_REAL, memspace, filespace, plist_id, T.f);
-
-		H5Dclose(dset_id);
-		H5Sclose(filespace);
-		H5Sclose(memspace);
-
-
-		/* datasets for coordinates, Y */
-		dims[0] = globalGridy.ny;
-		filespace = H5Screate_simple(1, dims, NULL);
-		dset_id = H5Dcreate(file_id, "y", C_H5_REAL, filespace, 
-			H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
-		H5Sclose(filespace);
-
-		offsets[0] = T.oy+1; counts[0] = T.ny-2;
-		filespace = H5Dget_space(dset_id);
-		H5Sselect_hyperslab(filespace, H5S_SELECT_SET, offsets, NULL, counts, NULL);
-
-		counts[0] = T.ny;
-		memspace = H5Screate_simple(1, counts, NULL);
-		counts[0] = T.ny-2; offsets[0] = 1;
-		H5Sselect_hyperslab(memspace, H5S_SELECT_SET, offsets, NULL, counts, NULL);
-
-		plist_id = H5Pcreate(H5P_DATASET_XFER);
-		H5Pset_dxpl_mpio(plist_id, H5FD_MPIO_COLLECTIVE);
-
-		status = H5Dwrite(dset_id, C_H5_REAL, memspace, filespace, plist_id, gridy.f);
-
-		H5Dclose(dset_id);
-		H5Sclose(filespace);
-		H5Sclose(memspace);
-
-
-		/* datasets for coordinates, X */
-		dims[0] = globalGridx.nx;
-		filespace = H5Screate_simple(1, dims, NULL);
-		dset_id = H5Dcreate(file_id, "x", C_H5_REAL, filespace, 
-			H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
-		H5Sclose(filespace);
-
-		offsets[0] = T.ox+1; counts[0] = T.nx-2;
-		filespace = H5Dget_space(dset_id);
-		H5Sselect_hyperslab(filespace, H5S_SELECT_SET, offsets, NULL, counts, NULL);
-
-		counts[0] = T.nx;
-		memspace = H5Screate_simple(1, counts, NULL);
-		counts[0] = T.nx-2; offsets[0] = 1;
-		H5Sselect_hyperslab(memspace, H5S_SELECT_SET, offsets, NULL, counts, NULL);
-
-		plist_id = H5Pcreate(H5P_DATASET_XFER);
-		H5Pset_dxpl_mpio(plist_id, H5FD_MPIO_COLLECTIVE);
-
-		status = H5Dwrite(dset_id, C_H5_REAL, memspace, filespace, plist_id, gridx.f);
-
-		H5Dclose(dset_id);
-		H5Sclose(filespace);
-		H5Sclose(memspace);
-
-
-		/* Close all opened HDF5 handles */
-		H5Pclose(plist_id);
-		H5Fclose(file_id);
-
-	}
-
-	time2 = MPI_Wtime();
-	if (iproc == 0) fprintf(stderr, "Writing took %g secs\n", time2-time1);
-
-	if (iproc == 0) {
-		config_destroy(&inputcfg);
-	}
+	writeFields(2, allFields, &gridy, &gridx, &mpistate, &globalConfig);
 
 	MPI_Finalize();
 
