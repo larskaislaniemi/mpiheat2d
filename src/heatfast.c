@@ -1,10 +1,10 @@
 #include <stdio.h>
-#include <mpi.h>
 #include <stdlib.h>
+#include <string.h>
 #include <math.h>
+#include <mpi.h>
 #include <hdf5.h>
 #include <libconfig.h>
-#include <string.h>
 
 #define IY 0
 #define IX 1
@@ -46,6 +46,7 @@ struct config {
 	Real Kdiff;           // heatdiffusivity
 	Real dt;              // time step
 	int niter;            // num of iters
+
 };
 
 void createMPIDatatypeConfig(struct config *c, MPI_Datatype *newtype) {
@@ -149,6 +150,118 @@ int nameField(struct field *f, char *name) {
 
 	return 0;
 }
+
+int readNumsFile(char *filename, Real **data, size_t *datasize) {
+	const size_t blocksize = 256;
+	FILE *fp;
+	size_t bufsize = 0;
+	size_t nread, eread, cread;
+	Real *buf = NULL;
+	char elem[blocksize];
+
+	if (*data != NULL) {
+		fprintf(stderr, "readNumsFile needs non-allocated mem pointer!\n");
+		return ERR_INTERNAL;
+	}
+
+	fp = fopen(filename, "r");
+	if (fp == NULL) {
+		fprintf(stderr, "Error opening file '%s'\n", filename);
+		return ERR_FILEOPER;
+	}
+
+	eread = 0;
+	nread = 0;
+	while (1) {
+		cread = fread(&elem[eread], 1, 1, fp);
+		if (eread == 0 && cread == 1 && elem[0] <= 32) continue;  // pre-whitespace or something like that...
+		if ((cread == 1 && elem[eread] <= 32) || (cread == 0 && eread > 0)) {  
+			// post-whitespace, interpret!
+			elem[eread] = '\0';
+			if (nread+1 > bufsize) {
+				bufsize += blocksize;
+				buf = realloc(buf, bufsize);
+			}
+			buf[nread] = atof(elem);
+			nread++;
+			eread = 0;
+		} else if (cread == 1) {
+			eread++;
+		} else {
+			// eof
+			break;
+		}
+	}
+
+	fclose(fp);
+
+	*data = buf;
+	*datasize = nread;
+
+	return 0;
+}
+
+int readFieldFile(struct field *fld, char *modelname) {
+	char datafile[STR_MAXLEN];
+	Real *indata = NULL;
+	size_t ncoords;
+	int ierr, ny, nx;
+	nx = fld->nx;
+	ny = fld->ny;
+
+	snprintf(datafile, STR_MAXLEN, "%s.%s.txt", modelname, fld->name);
+
+	ierr = readNumsFile(datafile, &indata, &ncoords);
+	if (ierr != 0) return ierr;
+
+	if (ncoords != ny*nx) {
+		fprintf(stderr, "readFieldFile(): Reading from %s: ncoords (%ld) != ny*nx (%ld)\n", datafile, ncoords, ny*nx);
+		return ERR_SIZE_MISMATCH;
+	}
+
+	for (int i = 0; i < ny; i++) {
+		for (int j = 0; j < nx; j++) {
+			fld->f[i*nx + j] = indata[i*nx + j];
+		}
+	}
+
+	return 0;
+}
+
+void readHdf5(struct field *fld, struct mpidata *mpistate, struct config *globalConfig) {
+
+	hid_t plist_id, dset_id, filespace, memspace, file_id;
+	hsize_t counts[2], offsets[2];
+	char fieldpath[STR_MAXLEN];
+	snprintf(fieldpath, STR_MAXLEN, "/%s", fld->name);
+
+	plist_id = H5Pcreate(H5P_FILE_ACCESS);
+	H5Pset_fapl_mpio(plist_id, mpistate->comm2d, MPI_INFO_NULL);
+	file_id = H5Fopen("data.h5", H5F_ACC_RDONLY, plist_id);
+	H5Pclose(plist_id);
+
+	dset_id = H5Dopen(file_id, fieldpath, H5P_DEFAULT);
+
+	offsets[0] = fld->oy+1; offsets[1] = fld->ox+1;
+	counts[0] = fld->ny-2; counts[1] = fld->nx-2;
+	filespace = H5Dget_space(dset_id);
+	H5Sselect_hyperslab(filespace, H5S_SELECT_SET, offsets, NULL, counts, NULL);
+
+	counts[0] = fld->ny; counts[1] = fld->nx;
+	memspace = H5Screate_simple(2, counts, NULL);
+	counts[0] = fld->ny-2; counts[1] = fld->nx-2;
+	offsets[0] = 1; offsets[1] = 1;
+	H5Sselect_hyperslab(memspace, H5S_SELECT_SET, offsets, NULL, counts, NULL);
+	H5Dread(dset_id, C_H5_REAL, memspace, filespace, H5P_DEFAULT, fld->f);
+
+	H5Dclose(dset_id);
+	H5Fclose(file_id);
+}
+
+
+
+
+
 
 void writeFields(int nfields, struct field **fields, 
 		struct field *gridy, struct field *gridx, 
@@ -294,7 +407,7 @@ void readConfig(struct config *globalConfig, const char *configfile) {
 	MPI_Comm_rank(MPI_COMM_WORLD, &iproc);
 	MPI_Comm_size(MPI_COMM_WORLD, &nproc);
 
-	/* read config */
+	/* read config and read initial fields */
 	if (iproc == 0) {
 
 		cfgfp = fopen(configfile, "r");
@@ -341,7 +454,7 @@ int main(int argc, char **argv) {
 	mpistate.mpicomm_reorder = 1;
 	mpistate.mpicomm_periods[0] = 0; 
 	mpistate.mpicomm_periods[1] = 0;
-	int iproc, nproc;
+	int iproc, nproc, ierr;
 
 	//int mpicoord[2];
 
@@ -407,6 +520,14 @@ int main(int argc, char **argv) {
 	for (int i = 0; i < globalGridy.ny; i++) globalGridy.f[i] = i*dy;
 	for (int j = 0; j < globalGridx.nx; j++) globalGridx.f[j] = j*dx;
 
+	/*
+	 * === if one wants to read the grid in, too:
+	 * nameField(&globalGridx, "globalGridx");
+	 * ierr = readFieldFile(&globalGridx, "test");
+	 * if (ierr != 0) MPI_Abort(MPI_COMM_WORLD, ierr);
+	 * printDomains(&mpistate, &gridx);
+	 */
+
 	gridx.nx = globalConfig.nx / globalConfig.px + 2; gridx.ny = 1;
 	gridy.ny = globalConfig.ny / globalConfig.py + 2; gridy.nx = 1;
 	gridx.ox = mpistate.mpicoord[IX] * globalConfig.nx / globalConfig.px - 1; gridx.oy = 0;
@@ -419,7 +540,7 @@ int main(int argc, char **argv) {
 	/* initialize fields */
 	T.nx = gridx.nx; T.ny = gridy.ny; 
 	T.ox = gridx.ox; T.oy = gridy.oy;
-	T.f = malloc(sizeof(Real) * T.nx*T.ny);
+	T.f = calloc(sizeof(Real), T.nx*T.ny);
 
 	createFromField(&T, &Told);
 
@@ -430,7 +551,30 @@ int main(int argc, char **argv) {
 	allFields[0] = &T;
 	allFields[1] = &Told;
 
+	readHdf5(&T, &mpistate, &globalConfig);
 
+		/* TODO TODO TODO : this to a subroutine (and the one within the time loop */
+		MPI_Cart_shift(mpistate.comm2d, IY, 1, &mpistate.rank_neighb[0], &mpistate.rank_neighb[1]);
+		MPI_Cart_shift(mpistate.comm2d, IX, 1, &mpistate.rank_neighb[2], &mpistate.rank_neighb[3]);
+		for (int i = 0; i < 4; i++) if (mpistate.rank_neighb[i] < 0) mpistate.rank_neighb[i] = MPI_PROC_NULL;
+
+		// send lower and upper row
+		MPI_Sendrecv(&T.f[T.nx*(T.ny-2)], T.nx, C_MPI_REAL, mpistate.rank_neighb[1], 0, 
+				&T.f[0], T.nx, C_MPI_REAL, mpistate.rank_neighb[0], 0, mpistate.comm2d, MPI_STATUS_IGNORE);
+		MPI_Sendrecv(&T.f[T.nx*1], T.nx, C_MPI_REAL, mpistate.rank_neighb[0], 0, 
+				&T.f[T.nx*(T.ny-1)], T.nx, C_MPI_REAL, mpistate.rank_neighb[1], 0, mpistate.comm2d, MPI_STATUS_IGNORE);
+
+		// send right and left column
+		MPI_Type_vector(T.ny, 1, T.nx, C_MPI_REAL, &columntype);
+		MPI_Type_commit(&columntype);
+		MPI_Sendrecv(&T.f[T.nx-2], 1, columntype, mpistate.rank_neighb[3], 0, 
+				&T.f[0], 1, columntype, mpistate.rank_neighb[2], 0, mpistate.comm2d, MPI_STATUS_IGNORE);
+		MPI_Sendrecv(&T.f[1], 1, columntype, mpistate.rank_neighb[2], 0, 
+				&T.f[T.nx-1], 1, columntype, mpistate.rank_neighb[3], 0, mpistate.comm2d, MPI_STATUS_IGNORE);
+		MPI_Type_free(&columntype);
+
+	printDomains(&mpistate, &T);
+	return 0;
 
 	/* setup initial values */
 	for (int i = 0; i < gridy.ny; i++) {
