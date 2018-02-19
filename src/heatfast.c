@@ -22,6 +22,8 @@ typedef double Real;               // NB! libconfig currently support double, no
 #define C_MPI_REAL MPI_DOUBLE
 #define C_H5_REAL H5T_NATIVE_DOUBLE
 
+#define MIN(X, Y) (((X) < (Y)) ? (X) : (Y))
+
 
 
 /* MPIDATA and related routines */
@@ -46,39 +48,90 @@ struct config {
 	Real Kdiff;           // heatdiffusivity
 	Real dt;              // time step
 	int niter;            // num of iters
-
+	char initfile[STR_MAXLEN];      // where from to read initial conditions
 };
 
 void createMPIDatatypeConfig(struct config *c, MPI_Datatype *newtype) {
-	const int configStructLen = 9;
-	const int configBlockLens[9] = {
+	MPI_Datatype strarray;
+	MPI_Type_vector(1, STR_MAXLEN, 1, MPI_CHAR, &strarray);
+
+	const int configStructLen = 10;
+	const int configBlockLens[10] = {
 		1, 1, 1, 1,
 		1, 1, 
 		1,
 		1,
+		1,
 		1
 	};
-	const MPI_Datatype configDatatypes[9] = {
+	const MPI_Datatype configDatatypes[10] = {
 		MPI_INT, MPI_INT, MPI_INT, MPI_INT,
 		C_MPI_REAL, C_MPI_REAL,
 		C_MPI_REAL,
 		C_MPI_REAL,
-		MPI_INT
+		MPI_INT,
+		strarray
 	};
-	MPI_Aint configDisplacements[9];
+	MPI_Aint configDisplacements[10];
 
 	configDisplacements[0] = (long int)&c->nx;
-	configDisplacements[1] = (long int)&c->ny    - configDisplacements[0];
-	configDisplacements[2] = (long int)&c->px    - configDisplacements[0];
-	configDisplacements[3] = (long int)&c->py    - configDisplacements[0];
-	configDisplacements[4] = (long int)&c->Lx    - configDisplacements[0];
-	configDisplacements[5] = (long int)&c->Ly    - configDisplacements[0];
-	configDisplacements[6] = (long int)&c->Kdiff - configDisplacements[0];
-	configDisplacements[7] = (long int)&c->dt    - configDisplacements[0];
-	configDisplacements[8] = (long int)&c->niter - configDisplacements[0];
+	configDisplacements[1] = (long int)&c->ny       - configDisplacements[0];
+	configDisplacements[2] = (long int)&c->px       - configDisplacements[0];
+	configDisplacements[3] = (long int)&c->py       - configDisplacements[0];
+	configDisplacements[4] = (long int)&c->Lx       - configDisplacements[0];
+	configDisplacements[5] = (long int)&c->Ly       - configDisplacements[0];
+	configDisplacements[6] = (long int)&c->Kdiff    - configDisplacements[0];
+	configDisplacements[7] = (long int)&c->dt       - configDisplacements[0];
+	configDisplacements[8] = (long int)&c->niter    - configDisplacements[0];
+	configDisplacements[9] = (long int)&c->initfile - configDisplacements[0];
 	configDisplacements[0] = 0;
 
 	MPI_Type_create_struct(configStructLen, configBlockLens, configDisplacements, configDatatypes, newtype);
+}
+
+
+int domainDecomp(int nx, int ny, int np, int *px, int *py) {
+	int rx, ry, sx, sy, sp;
+	double b2log;
+
+	b2log = log((double)nx) / log(2.0);
+	rx = (int)b2log;
+	if (b2log != rx) {
+		fprintf(stderr, "nx is not an exponent of two\n");
+		return ERR_SIZE_MISMATCH|ERR_CFGFILE;
+	}
+
+	b2log = log((double)ny) / log(2.0);
+	ry = (int)b2log;
+	if (b2log != ry) {
+		fprintf(stderr, "ny is not an exponent of two\n");
+		return ERR_SIZE_MISMATCH|ERR_CFGFILE;
+	}
+
+	b2log = log((double)np) / log(2.0);
+	sp = (int)b2log;
+	if (b2log != sp) {
+		fprintf(stderr, "np is not an exponent of two\n");
+		return ERR_SIZE_MISMATCH|ERR_CFGFILE;
+	}
+
+	sy = (ry - rx + sp) / 2;
+	sx = sp - sy;
+
+	if (sy + sx != sp) {
+		fprintf(stderr, "domainDecomp(): sy + sx != sp\n");
+		return ERR_INTERNAL;
+	}
+
+	*px = pow(2.0, sx);
+	*py = pow(2.0, sy);
+
+	if (*py * *px != np) {
+		fprintf(stderr, "domainDecomp(): py + px != np\n");
+		return ERR_INTERNAL;
+	}
+
+	return 0;
 }
 
 
@@ -105,6 +158,29 @@ Real gen_field_T(Real y, Real x) {
 	} else {
 		return 0.0;
 	}
+}
+
+void communicateHalos(struct mpidata *mpistate, struct field *fld) {
+	MPI_Datatype columntype;
+
+	MPI_Cart_shift(mpistate->comm2d, IY, 1, &mpistate->rank_neighb[0], &mpistate->rank_neighb[1]);
+	MPI_Cart_shift(mpistate->comm2d, IX, 1, &mpistate->rank_neighb[2], &mpistate->rank_neighb[3]);
+	for (int i = 0; i < 4; i++) if (mpistate->rank_neighb[i] < 0) mpistate->rank_neighb[i] = MPI_PROC_NULL;
+
+	// send lower and upper row
+	MPI_Sendrecv(&fld->f[fld->nx*(fld->ny-2)], fld->nx, C_MPI_REAL, mpistate->rank_neighb[1], 0, 
+			&fld->f[0], fld->nx, C_MPI_REAL, mpistate->rank_neighb[0], 0, mpistate->comm2d, MPI_STATUS_IGNORE);
+	MPI_Sendrecv(&fld->f[fld->nx*1], fld->nx, C_MPI_REAL, mpistate->rank_neighb[0], 0, 
+			&fld->f[fld->nx*(fld->ny-1)], fld->nx, C_MPI_REAL, mpistate->rank_neighb[1], 0, mpistate->comm2d, MPI_STATUS_IGNORE);
+
+	// send right and left column
+	MPI_Type_vector(fld->ny, 1, fld->nx, C_MPI_REAL, &columntype);
+	MPI_Type_commit(&columntype);
+	MPI_Sendrecv(&fld->f[fld->nx-2], 1, columntype, mpistate->rank_neighb[3], 0, 
+			&fld->f[0], 1, columntype, mpistate->rank_neighb[2], 0, mpistate->comm2d, MPI_STATUS_IGNORE);
+	MPI_Sendrecv(&fld->f[1], 1, columntype, mpistate->rank_neighb[2], 0, 
+			&fld->f[fld->nx-1], 1, columntype, mpistate->rank_neighb[3], 0, mpistate->comm2d, MPI_STATUS_IGNORE);
+	MPI_Type_free(&columntype);
 }
 
 void swapFields(struct field *const a, struct field *const b) {
@@ -228,7 +304,7 @@ int readFieldFile(struct field *fld, char *modelname) {
 	return 0;
 }
 
-void readHdf5(struct field *fld, struct mpidata *mpistate, struct config *globalConfig) {
+void readHdf5(struct field *fld, struct mpidata *mpistate, char *filename) {
 
 	hid_t plist_id, dset_id, filespace, memspace, file_id;
 	hsize_t counts[2], offsets[2];
@@ -237,7 +313,12 @@ void readHdf5(struct field *fld, struct mpidata *mpistate, struct config *global
 
 	plist_id = H5Pcreate(H5P_FILE_ACCESS);
 	H5Pset_fapl_mpio(plist_id, mpistate->comm2d, MPI_INFO_NULL);
-	file_id = H5Fopen("data.h5", H5F_ACC_RDONLY, plist_id);
+	file_id = H5Fopen(filename, H5F_ACC_RDONLY, plist_id);
+	if (file_id < 0) {
+		fprintf(stderr, "readHdf5(): Cannot open file %s\n", filename);
+		MPI_Abort(MPI_COMM_WORLD, ERR_FILEOPER);
+		exit(ERR_FILEOPER);
+	}
 	H5Pclose(plist_id);
 
 	dset_id = H5Dopen(file_id, fieldpath, H5P_DEFAULT);
@@ -401,6 +482,7 @@ void printDomains(struct mpidata const *const mpistate, struct field const *cons
 void readConfig(struct config *globalConfig, const char *configfile) {
 	FILE *cfgfp;
 	int iproc, nproc;
+	char *tmpstring;
 	config_t inputcfg;
 	MPI_Datatype globalConfigMPIType;
 
@@ -425,10 +507,12 @@ void readConfig(struct config *globalConfig, const char *configfile) {
 		if (config_lookup_int(&inputcfg, "grid.ny", &globalConfig->ny) != CONFIG_TRUE) { fprintf(stderr, "config option grid.ny needed but not found\n"); MPI_Abort(MPI_COMM_WORLD, ERR_CFGFILE); exit(ERR_CFGFILE); }
 		if (config_lookup_float(&inputcfg, "grid.Lx", &globalConfig->Lx) != CONFIG_TRUE) { fprintf(stderr, "config option grid.Lx needed but not found\n"); MPI_Abort(MPI_COMM_WORLD, ERR_CFGFILE); exit(ERR_CFGFILE); }
 		if (config_lookup_float(&inputcfg, "grid.Ly", &globalConfig->Ly) != CONFIG_TRUE) { fprintf(stderr, "config option grid.Ly needed but not found\n"); MPI_Abort(MPI_COMM_WORLD, ERR_CFGFILE); exit(ERR_CFGFILE); }
-		if (config_lookup_int(&inputcfg, "mpi.px", &globalConfig->px) != CONFIG_TRUE) { fprintf(stderr, "config option mpi.px needed but not found\n"); MPI_Abort(MPI_COMM_WORLD, ERR_CFGFILE); exit(ERR_CFGFILE); }
-		if (config_lookup_int(&inputcfg, "mpi.py", &globalConfig->py) != CONFIG_TRUE) { fprintf(stderr, "config option mpi.py needed but not found\n"); MPI_Abort(MPI_COMM_WORLD, ERR_CFGFILE); exit(ERR_CFGFILE); }
 		if (config_lookup_float(&inputcfg, "phys.kdiff", &globalConfig->Kdiff) != CONFIG_TRUE) { fprintf(stderr, "config option phys.kdiff needed but not found\n"); MPI_Abort(MPI_COMM_WORLD, ERR_CFGFILE); exit(ERR_CFGFILE); }
 		if (config_lookup_int(&inputcfg, "run.iter", &globalConfig->niter) != CONFIG_TRUE) { fprintf(stderr, "config option run.iter needed but not found\n"); MPI_Abort(MPI_COMM_WORLD, ERR_CFGFILE); exit(ERR_CFGFILE); }
+		if (config_lookup_float(&inputcfg, "run.dt", &globalConfig->dt) != CONFIG_TRUE) { fprintf(stderr, "config option run.dt needed but not found\n"); MPI_Abort(MPI_COMM_WORLD, ERR_CFGFILE); exit(ERR_CFGFILE); }
+		if (config_lookup_string(&inputcfg, "initcond.init_file", &tmpstring) != CONFIG_TRUE) { fprintf(stderr, "config option initcond.init_file needed but not found\n"); MPI_Abort(MPI_COMM_WORLD, ERR_CFGFILE); exit(ERR_CFGFILE); }
+		strncpy(globalConfig->initfile, tmpstring, STR_MAXLEN);
+		globalConfig->initfile[STR_MAXLEN-1] = '\0';
 	}
 	createMPIDatatypeConfig(globalConfig, &globalConfigMPIType);
 	MPI_Type_commit(&globalConfigMPIType);
@@ -456,16 +540,14 @@ int main(int argc, char **argv) {
 	mpistate.mpicomm_periods[1] = 0;
 	int iproc, nproc, ierr;
 
-	//int mpicoord[2];
-
 	struct config globalConfig;
 
 	struct field T, Told;
+	struct field Kdiff;
 	struct field globalGridx, globalGridy, gridx, gridy;
 	struct field **allFields;
 
 	Real dy, dx;
-	MPI_Datatype columntype;
 
 
 	/* inits */
@@ -473,6 +555,7 @@ int main(int argc, char **argv) {
 
 	MPI_Comm_rank(MPI_COMM_WORLD, &iproc);
 	MPI_Comm_size(MPI_COMM_WORLD, &nproc);
+
 
 
 	/* read config */
@@ -485,18 +568,17 @@ int main(int argc, char **argv) {
 
 	readConfig(&globalConfig, argv[1]);
 
-
+		
 	/* find good proc configuration */
-	if (globalConfig.nx % globalConfig.px != 0 || globalConfig.ny % globalConfig.py != 0) {
-		fprintf(stderr, "globalConfig.nx %% globalConfig.px != 0 || globalConfig.ny %% globalConfig.py != 0\n");
-		MPI_Abort(MPI_COMM_WORLD, ERR_CONFIG);
-		exit(ERR_CONFIG);
+
+	ierr = domainDecomp(globalConfig.nx, globalConfig.ny, nproc, &(globalConfig.px), &(globalConfig.py));
+	if (ierr != 0) {
+		MPI_Abort(MPI_COMM_WORLD, ierr);
+		exit(ierr);
 	}
 
-	if (nproc != globalConfig.px*globalConfig.py) {
-		fprintf(stderr, "nproc (%d) != globalConfig.px*globalConfig.py (%d)\n", nproc, globalConfig.px*globalConfig.py);
-		MPI_Abort(MPI_COMM_WORLD, ERR_CONFIG);
-		exit(ERR_CONFIG);
+	if (iproc == 0) {
+		fprintf(stdout, "Proc configuration: nx,ny = %d,%d; np = %d; px,py = %d, %d\n", globalConfig.nx, globalConfig.ny, nproc, globalConfig.px, globalConfig.py);
 	}
 
 	mpistate.mpicomm_dims[IY] = globalConfig.py;
@@ -506,11 +588,13 @@ int main(int argc, char **argv) {
 	MPI_Cart_get(mpistate.comm2d, mpistate.mpicomm_ndims, mpistate.mpicomm_dims, mpistate.mpicomm_periods, mpistate.mpicoord);
 
 
+	
+	
+	
 	/* init grids */
 
 	dy = globalConfig.Ly / (globalConfig.ny-1);
 	dx = globalConfig.Lx / (globalConfig.nx-1);
-	globalConfig.dt = 0.5 * dx*dx * dy*dy / (2.0 * globalConfig.Kdiff * (dx*dx + dy*dy));
 	globalGridx.nx = globalConfig.nx; globalGridx.ny = 1;
 	globalGridy.ny = globalConfig.ny; globalGridy.nx = 1;
 	globalGridx.ox = globalGridx.oy = 0;
@@ -519,14 +603,6 @@ int main(int argc, char **argv) {
 	globalGridx.f = malloc(sizeof(Real) * globalGridx.nx);
 	for (int i = 0; i < globalGridy.ny; i++) globalGridy.f[i] = i*dy;
 	for (int j = 0; j < globalGridx.nx; j++) globalGridx.f[j] = j*dx;
-
-	/*
-	 * === if one wants to read the grid in, too:
-	 * nameField(&globalGridx, "globalGridx");
-	 * ierr = readFieldFile(&globalGridx, "test");
-	 * if (ierr != 0) MPI_Abort(MPI_COMM_WORLD, ierr);
-	 * printDomains(&mpistate, &gridx);
-	 */
 
 	gridx.nx = globalConfig.nx / globalConfig.px + 2; gridx.ny = 1;
 	gridy.ny = globalConfig.ny / globalConfig.py + 2; gridy.nx = 1;
@@ -537,63 +613,64 @@ int main(int argc, char **argv) {
 	for (int i = 0; i < gridy.ny; i++) gridy.f[i] = (i + gridy.oy)*dy;
 	for (int j = 0; j < gridx.nx; j++) gridx.f[j] = (j + gridx.ox)*dx;
 
+	
+	
 	/* initialize fields */
 	T.nx = gridx.nx; T.ny = gridy.ny; 
 	T.ox = gridx.ox; T.oy = gridy.oy;
 	T.f = calloc(sizeof(Real), T.nx*T.ny);
-
 	createFromField(&T, &Told);
-
 	nameField(&T, "T");
 	nameField(&Told, "Told");
 
-	allFields = malloc(sizeof(struct field *) * 2);
+	Kdiff.nx = gridx.nx; Kdiff.ny = gridy.ny; 
+	Kdiff.ox = gridx.ox; Kdiff.oy = gridy.oy;
+	Kdiff.f = calloc(sizeof(Real), Kdiff.nx*Kdiff.ny);
+	nameField(&Kdiff, "Kdiff");
+
+
+	allFields = malloc(sizeof(struct field *) * 3);
 	allFields[0] = &T;
 	allFields[1] = &Told;
+	allFields[2] = &Kdiff;
 
-	readHdf5(&T, &mpistate, &globalConfig);
 
-		/* TODO TODO TODO : this to a subroutine (and the one within the time loop */
-		MPI_Cart_shift(mpistate.comm2d, IY, 1, &mpistate.rank_neighb[0], &mpistate.rank_neighb[1]);
-		MPI_Cart_shift(mpistate.comm2d, IX, 1, &mpistate.rank_neighb[2], &mpistate.rank_neighb[3]);
-		for (int i = 0; i < 4; i++) if (mpistate.rank_neighb[i] < 0) mpistate.rank_neighb[i] = MPI_PROC_NULL;
+	readHdf5(&T, &mpistate, globalConfig.initfile);
+	readHdf5(&Kdiff, &mpistate, globalConfig.initfile);
 
-		// send lower and upper row
-		MPI_Sendrecv(&T.f[T.nx*(T.ny-2)], T.nx, C_MPI_REAL, mpistate.rank_neighb[1], 0, 
-				&T.f[0], T.nx, C_MPI_REAL, mpistate.rank_neighb[0], 0, mpistate.comm2d, MPI_STATUS_IGNORE);
-		MPI_Sendrecv(&T.f[T.nx*1], T.nx, C_MPI_REAL, mpistate.rank_neighb[0], 0, 
-				&T.f[T.nx*(T.ny-1)], T.nx, C_MPI_REAL, mpistate.rank_neighb[1], 0, mpistate.comm2d, MPI_STATUS_IGNORE);
+	communicateHalos(&mpistate, &T);
+	communicateHalos(&mpistate, &Kdiff);
 
-		// send right and left column
-		MPI_Type_vector(T.ny, 1, T.nx, C_MPI_REAL, &columntype);
-		MPI_Type_commit(&columntype);
-		MPI_Sendrecv(&T.f[T.nx-2], 1, columntype, mpistate.rank_neighb[3], 0, 
-				&T.f[0], 1, columntype, mpistate.rank_neighb[2], 0, mpistate.comm2d, MPI_STATUS_IGNORE);
-		MPI_Sendrecv(&T.f[1], 1, columntype, mpistate.rank_neighb[2], 0, 
-				&T.f[T.nx-1], 1, columntype, mpistate.rank_neighb[3], 0, mpistate.comm2d, MPI_STATUS_IGNORE);
-		MPI_Type_free(&columntype);
-
-	printDomains(&mpistate, &T);
-	return 0;
-
-	/* setup initial values */
-	for (int i = 0; i < gridy.ny; i++) {
-		for (int j = 0; j < gridx.nx; j++) {
-			T.f[i*gridx.nx + j] = gen_field_T(gridy.f[i], gridx.f[j]);
-		}
-	}
 
 	for (int iter = 0; iter < globalConfig.niter; iter++) {
+		Real dtlocal, dtglobal, maxK;
+		maxK = 0.0;
+
 		if (iproc == 0) fprintf(stdout, "Iter %d\n", iter);
 		/* take a time step */
 		swapFields(&T, &Told);
 		
+		if (globalConfig.dt > 0) {
+			dtglobal = globalConfig.dt;
+		} else {
+			for (int i = 0; i < T.ny; i++)
+				for (int j = 0; j < T.nx; j++)
+					if (Kdiff.f[i*T.nx + j] > maxK) maxK = Kdiff.f[i*T.nx + j];
+			dtlocal = 0.25 * pow(MIN(dx, dy), 2.0) / (4.0*maxK);
+			MPI_Allreduce(&dtlocal, &dtglobal, 1, C_MPI_REAL, MPI_MIN, mpistate.comm2d);
+		}
+
 		for (int i = 1; i < T.ny-1; i++) {
 			for (int j = 1; j < T.nx-1; j++) {
-				// TODO: Variable dx/dy, variable k,rho,Cp
-				T.f[i*T.nx + j] = globalConfig.dt * (
-						globalConfig.Kdiff * (Told.f[i*T.nx + j+1] - 2.0*Told.f[i*T.nx + j] + Told.f[i*T.nx + j-1]) / (dx*dx) +
-						globalConfig.Kdiff * (Told.f[(i+1)*T.nx + j] - 2.0*Told.f[i*T.nx + j] + Told.f[(i-1)*T.nx + j]) / (dy*dy)
+				T.f[i*T.nx + j] = dtglobal * (
+						(
+						 0.5 * (Kdiff.f[i*T.nx + j+1] + Kdiff.f[i*T.nx + j]) * (Told.f[i*T.nx + j+1] - Told.f[i*T.nx + j]) / dx + 
+						 0.5 * (Kdiff.f[i*T.nx + j] + Kdiff.f[i*T.nx + j-1]) * (Told.f[i*T.nx + j] - Told.f[i*T.nx + j-1]) / dx
+						) / dx +
+						(
+						 0.5 * (Kdiff.f[(i+1)*T.nx + j] + Kdiff.f[i*T.nx + j]) * (Told.f[(i+1)*T.nx + j] - Told.f[i*T.nx + j]) / dy + 
+						 0.5 * (Kdiff.f[i*T.nx + j] + Kdiff.f[(i-1)*T.nx + j]) * (Told.f[i*T.nx + j] - Told.f[(i-1)*T.nx + j]) / dy
+						) / dy
 					) + Told.f[i*T.nx + j];
 			}
 		}
@@ -629,29 +706,12 @@ int main(int argc, char **argv) {
 		}
 
 		/* send halos around */
-
-		MPI_Cart_shift(mpistate.comm2d, IY, 1, &mpistate.rank_neighb[0], &mpistate.rank_neighb[1]);
-		MPI_Cart_shift(mpistate.comm2d, IX, 1, &mpistate.rank_neighb[2], &mpistate.rank_neighb[3]);
-		for (int i = 0; i < 4; i++) if (mpistate.rank_neighb[i] < 0) mpistate.rank_neighb[i] = MPI_PROC_NULL;
-
-		// send lower and upper row
-		MPI_Sendrecv(&T.f[T.nx*(T.ny-2)], T.nx, C_MPI_REAL, mpistate.rank_neighb[1], 0, 
-				&T.f[0], T.nx, C_MPI_REAL, mpistate.rank_neighb[0], 0, mpistate.comm2d, MPI_STATUS_IGNORE);
-		MPI_Sendrecv(&T.f[T.nx*1], T.nx, C_MPI_REAL, mpistate.rank_neighb[0], 0, 
-				&T.f[T.nx*(T.ny-1)], T.nx, C_MPI_REAL, mpistate.rank_neighb[1], 0, mpistate.comm2d, MPI_STATUS_IGNORE);
-
-		// send right and left column
-		MPI_Type_vector(T.ny, 1, T.nx, C_MPI_REAL, &columntype);
-		MPI_Type_commit(&columntype);
-		MPI_Sendrecv(&T.f[T.nx-2], 1, columntype, mpistate.rank_neighb[3], 0, 
-				&T.f[0], 1, columntype, mpistate.rank_neighb[2], 0, mpistate.comm2d, MPI_STATUS_IGNORE);
-		MPI_Sendrecv(&T.f[1], 1, columntype, mpistate.rank_neighb[2], 0, 
-				&T.f[T.nx-1], 1, columntype, mpistate.rank_neighb[3], 0, mpistate.comm2d, MPI_STATUS_IGNORE);
-		MPI_Type_free(&columntype);
+		communicateHalos(&mpistate, &T);
+		communicateHalos(&mpistate, &Kdiff);
 
 	}
 
-	writeFields(2, allFields, &gridy, &gridx, &mpistate, &globalConfig);
+	writeFields(3, allFields, &gridy, &gridx, &mpistate, &globalConfig);
 
 	MPI_Finalize();
 
