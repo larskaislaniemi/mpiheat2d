@@ -14,6 +14,7 @@
 #define ERR_CMDLINE_ARGUMENT 4
 #define ERR_FILEOPER 8
 #define ERR_CFGFILE 16
+#define ERR_INVALID_OPTION 32
 #define ERR_INTERNAL 65536
 
 #define STR_MAXLEN 255
@@ -49,30 +50,43 @@ struct config {
 	Real dt;              // time step
 	int niter;            // num of iters
 	char initfile[STR_MAXLEN];      // where from to read initial conditions
+	int bctypes[4];       // boundary condition types
+	Real bcvalues[4];     // boundary condition values
 };
 
 void createMPIDatatypeConfig(struct config *c, MPI_Datatype *newtype) {
-	MPI_Datatype strarray;
-	MPI_Type_vector(1, STR_MAXLEN, 1, MPI_CHAR, &strarray);
+	MPI_Datatype strarray, intarray, realarray;
+	MPI_Aint configDisplacements[12];
 
-	const int configStructLen = 10;
-	const int configBlockLens[10] = {
+	MPI_Type_vector(1, STR_MAXLEN, 1, MPI_CHAR, &strarray);
+	MPI_Type_vector(1, 4, 1, MPI_INT, &intarray);
+	MPI_Type_vector(1, 4, 1, C_MPI_REAL, &realarray);
+
+	MPI_Type_commit(&strarray);
+	MPI_Type_commit(&intarray);
+	MPI_Type_commit(&realarray);
+
+	const int configStructLen = 12;
+	const int configBlockLens[12] = {
 		1, 1, 1, 1,
 		1, 1, 
 		1,
 		1,
 		1,
+		1,
+		1,
 		1
 	};
-	const MPI_Datatype configDatatypes[10] = {
+	const MPI_Datatype configDatatypes[12] = {
 		MPI_INT, MPI_INT, MPI_INT, MPI_INT,
 		C_MPI_REAL, C_MPI_REAL,
 		C_MPI_REAL,
 		C_MPI_REAL,
 		MPI_INT,
-		strarray
+		strarray,
+		intarray,
+		realarray
 	};
-	MPI_Aint configDisplacements[10];
 
 	configDisplacements[0] = (long int)&c->nx;
 	configDisplacements[1] = (long int)&c->ny       - configDisplacements[0];
@@ -84,9 +98,15 @@ void createMPIDatatypeConfig(struct config *c, MPI_Datatype *newtype) {
 	configDisplacements[7] = (long int)&c->dt       - configDisplacements[0];
 	configDisplacements[8] = (long int)&c->niter    - configDisplacements[0];
 	configDisplacements[9] = (long int)&c->initfile - configDisplacements[0];
+	configDisplacements[10]= (long int)&c->bctypes  - configDisplacements[0];
+	configDisplacements[11]= (long int)&c->bcvalues - configDisplacements[0];
 	configDisplacements[0] = 0;
 
 	MPI_Type_create_struct(configStructLen, configBlockLens, configDisplacements, configDatatypes, newtype);
+
+	MPI_Type_free(&strarray);
+	MPI_Type_free(&intarray);
+	MPI_Type_free(&realarray);
 }
 
 
@@ -97,21 +117,21 @@ int domainDecomp(int nx, int ny, int np, int *px, int *py) {
 	b2log = log((double)nx) / log(2.0);
 	rx = (int)b2log;
 	if (b2log != rx) {
-		fprintf(stderr, "nx is not an exponent of two\n");
+		fprintf(stderr, "nx (%d) is not an exponent of two\n", nx);
 		return ERR_SIZE_MISMATCH|ERR_CFGFILE;
 	}
 
 	b2log = log((double)ny) / log(2.0);
 	ry = (int)b2log;
 	if (b2log != ry) {
-		fprintf(stderr, "ny is not an exponent of two\n");
+		fprintf(stderr, "ny (%d) is not an exponent of two\n", ny);
 		return ERR_SIZE_MISMATCH|ERR_CFGFILE;
 	}
 
 	b2log = log((double)np) / log(2.0);
 	sp = (int)b2log;
 	if (b2log != sp) {
-		fprintf(stderr, "np is not an exponent of two\n");
+		fprintf(stderr, "np (%d) is not an exponent of two\n", np);
 		return ERR_SIZE_MISMATCH|ERR_CFGFILE;
 	}
 
@@ -183,6 +203,7 @@ void communicateHalos(struct mpidata *mpistate, struct field *fld) {
 	MPI_Type_free(&columntype);
 }
 
+
 void swapFields(struct field *const a, struct field *const b) {
 	Real *tmp;
 	int tmpox, tmpoy;
@@ -227,82 +248,6 @@ int nameField(struct field *f, char *name) {
 	return 0;
 }
 
-int readNumsFile(char *filename, Real **data, size_t *datasize) {
-	const size_t blocksize = 256;
-	FILE *fp;
-	size_t bufsize = 0;
-	size_t nread, eread, cread;
-	Real *buf = NULL;
-	char elem[blocksize];
-
-	if (*data != NULL) {
-		fprintf(stderr, "readNumsFile needs non-allocated mem pointer!\n");
-		return ERR_INTERNAL;
-	}
-
-	fp = fopen(filename, "r");
-	if (fp == NULL) {
-		fprintf(stderr, "Error opening file '%s'\n", filename);
-		return ERR_FILEOPER;
-	}
-
-	eread = 0;
-	nread = 0;
-	while (1) {
-		cread = fread(&elem[eread], 1, 1, fp);
-		if (eread == 0 && cread == 1 && elem[0] <= 32) continue;  // pre-whitespace or something like that...
-		if ((cread == 1 && elem[eread] <= 32) || (cread == 0 && eread > 0)) {  
-			// post-whitespace, interpret!
-			elem[eread] = '\0';
-			if (nread+1 > bufsize) {
-				bufsize += blocksize;
-				buf = realloc(buf, bufsize);
-			}
-			buf[nread] = atof(elem);
-			nread++;
-			eread = 0;
-		} else if (cread == 1) {
-			eread++;
-		} else {
-			// eof
-			break;
-		}
-	}
-
-	fclose(fp);
-
-	*data = buf;
-	*datasize = nread;
-
-	return 0;
-}
-
-int readFieldFile(struct field *fld, char *modelname) {
-	char datafile[STR_MAXLEN];
-	Real *indata = NULL;
-	size_t ncoords;
-	int ierr, ny, nx;
-	nx = fld->nx;
-	ny = fld->ny;
-
-	snprintf(datafile, STR_MAXLEN, "%s.%s.txt", modelname, fld->name);
-
-	ierr = readNumsFile(datafile, &indata, &ncoords);
-	if (ierr != 0) return ierr;
-
-	if (ncoords != ny*nx) {
-		fprintf(stderr, "readFieldFile(): Reading from %s: ncoords (%ld) != ny*nx (%ld)\n", datafile, ncoords, ny*nx);
-		return ERR_SIZE_MISMATCH;
-	}
-
-	for (int i = 0; i < ny; i++) {
-		for (int j = 0; j < nx; j++) {
-			fld->f[i*nx + j] = indata[i*nx + j];
-		}
-	}
-
-	return 0;
-}
 
 void readHdf5(struct field *fld, struct mpidata *mpistate, char *filename) {
 
@@ -338,9 +283,6 @@ void readHdf5(struct field *fld, struct mpidata *mpistate, char *filename) {
 	H5Dclose(dset_id);
 	H5Fclose(file_id);
 }
-
-
-
 
 
 
@@ -482,8 +424,9 @@ void printDomains(struct mpidata const *const mpistate, struct field const *cons
 void readConfig(struct config *globalConfig, const char *configfile) {
 	FILE *cfgfp;
 	int iproc, nproc;
-	char *tmpstring;
+	const char *tmpstring;
 	config_t inputcfg;
+	config_setting_t *bctypes, *bcvalues;
 	MPI_Datatype globalConfigMPIType;
 
 	MPI_Comm_rank(MPI_COMM_WORLD, &iproc);
@@ -508,11 +451,21 @@ void readConfig(struct config *globalConfig, const char *configfile) {
 		if (config_lookup_float(&inputcfg, "grid.Lx", &globalConfig->Lx) != CONFIG_TRUE) { fprintf(stderr, "config option grid.Lx needed but not found\n"); MPI_Abort(MPI_COMM_WORLD, ERR_CFGFILE); exit(ERR_CFGFILE); }
 		if (config_lookup_float(&inputcfg, "grid.Ly", &globalConfig->Ly) != CONFIG_TRUE) { fprintf(stderr, "config option grid.Ly needed but not found\n"); MPI_Abort(MPI_COMM_WORLD, ERR_CFGFILE); exit(ERR_CFGFILE); }
 		if (config_lookup_float(&inputcfg, "phys.kdiff", &globalConfig->Kdiff) != CONFIG_TRUE) { fprintf(stderr, "config option phys.kdiff needed but not found\n"); MPI_Abort(MPI_COMM_WORLD, ERR_CFGFILE); exit(ERR_CFGFILE); }
-		if (config_lookup_int(&inputcfg, "run.iter", &globalConfig->niter) != CONFIG_TRUE) { fprintf(stderr, "config option run.iter needed but not found\n"); MPI_Abort(MPI_COMM_WORLD, ERR_CFGFILE); exit(ERR_CFGFILE); }
 		if (config_lookup_float(&inputcfg, "run.dt", &globalConfig->dt) != CONFIG_TRUE) { fprintf(stderr, "config option run.dt needed but not found\n"); MPI_Abort(MPI_COMM_WORLD, ERR_CFGFILE); exit(ERR_CFGFILE); }
 		if (config_lookup_string(&inputcfg, "initcond.init_file", &tmpstring) != CONFIG_TRUE) { fprintf(stderr, "config option initcond.init_file needed but not found\n"); MPI_Abort(MPI_COMM_WORLD, ERR_CFGFILE); exit(ERR_CFGFILE); }
 		strncpy(globalConfig->initfile, tmpstring, STR_MAXLEN);
 		globalConfig->initfile[STR_MAXLEN-1] = '\0';
+		if (config_lookup_int(&inputcfg, "run.iter", &globalConfig->niter) != CONFIG_TRUE) { fprintf(stderr, "config option run.iter needed but not found\n"); MPI_Abort(MPI_COMM_WORLD, ERR_CFGFILE); exit(ERR_CFGFILE); }
+
+		bctypes = config_lookup(&inputcfg, "bccond.types");
+		if (bctypes == NULL || config_setting_is_array(bctypes) != CONFIG_TRUE) { fprintf(stderr, "config option bccond.types needed but not found or wrong type\n"); MPI_Abort(MPI_COMM_WORLD, ERR_CFGFILE); exit(ERR_CFGFILE); }
+		bcvalues = config_lookup(&inputcfg, "bccond.values");
+		if (bcvalues == NULL || config_setting_is_array(bctypes) != CONFIG_TRUE) { fprintf(stderr, "config option bccond.values needed but not found or wrong type\n"); MPI_Abort(MPI_COMM_WORLD, ERR_CFGFILE); exit(ERR_CFGFILE); }
+		
+		for (int i = 0; i < 4; i++) {
+			globalConfig->bctypes[i] = config_setting_get_int_elem(bctypes, i);
+			globalConfig->bcvalues[i] = config_setting_get_float_elem(bcvalues, i);
+		}
 	}
 	createMPIDatatypeConfig(globalConfig, &globalConfigMPIType);
 	MPI_Type_commit(&globalConfigMPIType);
@@ -677,31 +630,55 @@ int main(int argc, char **argv) {
 
 		if (mpistate.mpicoord[IX] == 0) {
 			// i have (part of) the left bnd
-			int j = 1;
-			for (int i = 0; i < T.ny; i++) {
-				T.f[i*T.nx + j] = 0.0;
+			if (globalConfig.bctypes[2] == 1) {
+				int j = 1;
+				for (int i = 0; i < T.ny; i++) {
+					T.f[i*T.nx + j] = globalConfig.bcvalues[2];
+				}
+			} else {
+				fprintf(stderr, "Unrecognized BC type for boundary x0\n");
+				MPI_Abort(MPI_COMM_WORLD, ERR_INVALID_OPTION|ERR_CONFIG);
+				exit(ERR_INVALID_OPTION|ERR_CONFIG);
 			}
 		} 
 		if (mpistate.mpicoord[IX] == globalConfig.px-1) {
 			// i have (part of) the right bnd bnd
-			int j = T.nx-2;
-			for (int i = 0; i < T.ny; i++) {
-				T.f[i*T.nx + j] = 0.0;
+			if (globalConfig.bctypes[3] == 1) {
+				int j = T.nx-2;
+				for (int i = 0; i < T.ny; i++) {
+					T.f[i*T.nx + j] = globalConfig.bcvalues[3];
+				}
+			} else {
+				fprintf(stderr, "Unrecognized BC type for boundary x1\n");
+				MPI_Abort(MPI_COMM_WORLD, ERR_INVALID_OPTION|ERR_CONFIG);
+				exit(ERR_INVALID_OPTION|ERR_CONFIG);
 			}
 		}
 
 		if (mpistate.mpicoord[IY] == 0) {
 			// i have (part of) the upper bnd
-			int i = 1;
-			for (int j = 0; j < T.nx; j++) {
-				T.f[i*T.nx + j] = 0.0;
+			if (globalConfig.bctypes[0] == 1) {
+				int i = 1;
+				for (int j = 0; j < T.nx; j++) {
+					T.f[i*T.nx + j] = globalConfig.bcvalues[0];
+				}
+			} else {
+				fprintf(stderr, "Unrecognized BC type for boundary y0\n");
+				MPI_Abort(MPI_COMM_WORLD, ERR_INVALID_OPTION|ERR_CONFIG);
+				exit(ERR_INVALID_OPTION|ERR_CONFIG);
 			}
 		}
 		if (mpistate.mpicoord[IY] == globalConfig.py-1) {
 			// i have (part of) the lower bnd bnd
-			int i = T.ny-2;
-			for (int j = 0; j < T.nx; j++) {
-				T.f[i*T.nx + j] = 0.0;
+			if (globalConfig.bctypes[1] == 1) {
+				int i = T.ny-2;
+				for (int j = 0; j < T.nx; j++) {
+					T.f[i*T.nx + j] = globalConfig.bcvalues[1];
+				}
+			} else {
+				fprintf(stderr, "Unrecognized BC type for boundary y1\n");
+				MPI_Abort(MPI_COMM_WORLD, ERR_INVALID_OPTION|ERR_CONFIG);
+				exit(ERR_INVALID_OPTION|ERR_CONFIG);
 			}
 		}
 

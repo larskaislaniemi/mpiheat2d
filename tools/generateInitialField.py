@@ -2,8 +2,8 @@
 import h5py
 import numpy as np
 
-nx = 8
-ny = 16
+nx = 2**11
+ny = 2**11
 Lx = 50e3
 Ly = 50e3
 

@@ -1,15 +1,27 @@
 <?xml version="1.0" ?>
 <!DOCTYPE Xdmf SYSTEM "Xdmf.dtd" []>
-<Xdmf Version="2.2">
-	
-	<Domain>
-		<Grid Name="temperatureGrid" GridType="Uniform">
-			<Topology ToppologyType="2DSMesh" NumberOfElements="2000 2000"/>
-			<Geometry GeometryType="X_Y">
-				<DataItem Dimensions="2000 2000" NumberType="Float" Precision="4" Format="HDF">
-					data.h5:/T
-				</DataItem>
-			</Geometry>
-		</Grid>
-	</Domain>
+<Xdmf Version="2.0">
+<Domain>
+	<Grid Name="grid1" GridType="Uniform">
+		<Topology TopologyType="2DRectMesh" Dimensions="16 8"/>
+		<Geometry GeometryType="VXVY">
+			<DataItem Dimensions="16" NumberType="Float" Precision="4" Format="HDF">
+				data.h5:/_coord_y
+			</DataItem>
+			<DataItem Dimensions="8" NumberType="Float" Precision="4" Format="HDF">
+				data.h5:/_coord_x
+			</DataItem>
+		</Geometry>
+		<Attribute Name="Temperature" AttributeType="Scalar" Center="Node">
+			<DataItem Dimensions="16 8" NumberType="Float" Precision="4" Format="HDF">
+				data.h5:/T
+			</DataItem>
+		</Attribute>
+		<Attribute Name="Diffusivity" AttributeType="Scalar" Center="Node">
+			<DataItem Dimensions="16 8" NumberType="Float" Precision="4" Format="HDF">
+				data.h5:/Kdiff
+			</DataItem>
+		</Attribute>
+	</Grid>
+</Domain>
 </Xdmf>
