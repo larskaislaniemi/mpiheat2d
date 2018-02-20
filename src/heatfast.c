@@ -5,54 +5,16 @@
 #include <mpi.h>
 #include <hdf5.h>
 #include <libconfig.h>
-
-#define IY 0
-#define IX 1
-
-#define ERR_CONFIG 1
-#define ERR_SIZE_MISMATCH 2
-#define ERR_CMDLINE_ARGUMENT 4
-#define ERR_FILEOPER 8
-#define ERR_CFGFILE 16
-#define ERR_INVALID_OPTION 32
-#define ERR_INTERNAL 65536
-
-#define STR_MAXLEN 255
-
-typedef double Real;               // NB! libconfig currently support double, not float
-#define C_MPI_REAL MPI_DOUBLE
-#define C_H5_REAL H5T_NATIVE_DOUBLE
-
-#define MIN(X, Y) (((X) < (Y)) ? (X) : (Y))
+#include "heatfast.h"
 
 
 
 /* MPIDATA and related routines */
 
-struct mpidata {
-	MPI_Comm comm2d;
-	int mpicomm_ndims;
-	int mpicomm_reorder;
-	int mpicomm_periods[2];
-	int mpicomm_dims[2];
-	int mpicoord[2];
-	int rank_neighb[4];
-};
-
 
 
 /* CONFIG and related routines */
 
-struct config {
-	int nx, ny, px, py;   // num of grid points; num of procs
-	Real Lx, Ly;          // physical dimensions
-	Real Kdiff;           // heatdiffusivity
-	Real dt;              // time step
-	int niter;            // num of iters
-	char initfile[STR_MAXLEN];      // where from to read initial conditions
-	int bctypes[4];       // boundary condition types
-	Real bcvalues[4];     // boundary condition values
-};
 
 void createMPIDatatypeConfig(struct config *c, MPI_Datatype *newtype) {
 	MPI_Datatype strarray, intarray, realarray;
@@ -157,27 +119,12 @@ int domainDecomp(int nx, int ny, int np, int *px, int *py) {
 
 /* FIELD and related routines */
 
-struct field {
-	Real *f;               // field values
-	char name[STR_MAXLEN]; // name of the field
-	int nx, ny;            // size of the field (grid points)
-	int ox, oy;            // origin of the field relative to the global grid origin
-};
 
 void createFromField(struct field const *const f1, struct field *const f2) {
 	strncpy(f2->name, f1->name, STR_MAXLEN);
 	f2->nx = f1->nx; f2->ny = f1->ny;
 	f2->ox = f1->ox; f2->oy = f1->oy;
 	f2->f = malloc(sizeof(Real) * f2->nx * f2->ny);
-}
-
-Real gen_field_T(Real y, Real x) {
-	return 1350.0;
-	if (pow(0.5-x, 2.0) + pow(0.5-y, 2.0) < 0.4*0.4) {
-		return 1.0;
-	} else {
-		return 0.0;
-	}
 }
 
 void communicateHalos(struct mpidata *mpistate, struct field *fld) {
@@ -286,9 +233,7 @@ void readHdf5(struct field *fld, struct mpidata *mpistate, char *filename) {
 
 
 
-void writeFields(int nfields, struct field **fields, 
-		struct field *gridy, struct field *gridx, 
-		struct mpidata *mpistate, struct config *globalConfig) {
+void writeFields(struct modeldata *mstate, struct mpidata *mpistate, struct config *globalConfig) {
 	//herr_t status;
 	hid_t plist_id, dset_id, filespace, memspace, file_id;
 	hsize_t dims[2], counts[2], offsets[2];
@@ -310,28 +255,28 @@ void writeFields(int nfields, struct field **fields,
 
 	/* create datasets */
 
-	for (int ifield = 0; ifield < nfields; ifield++) {
+	for (int ifield = 0; ifield < mstate->nfields; ifield++) {
 		/* Create the dataset */
 		dims[0] = ny;
 		dims[1] = nx;
 		filespace = H5Screate_simple(2, dims, NULL);
-		dset_id = H5Dcreate(file_id, fields[ifield]->name, C_H5_REAL, filespace,
+		dset_id = H5Dcreate(file_id, mstate->fields[ifield]->name, C_H5_REAL, filespace,
 			H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
 		H5Sclose(filespace);
 
 		/* Select a hyperslab of the file dataspace */
-		offsets[0] = fields[ifield]->oy+1; offsets[1] = fields[ifield]->ox+1;
-		counts[0] = fields[ifield]->ny-2; counts[1] = fields[ifield]->nx-2;
+		offsets[0] = mstate->fields[ifield]->oy+1; offsets[1] = mstate->fields[ifield]->ox+1;
+		counts[0] = mstate->fields[ifield]->ny-2; counts[1] = mstate->fields[ifield]->nx-2;
 		filespace = H5Dget_space(dset_id);
 		H5Sselect_hyperslab(filespace, H5S_SELECT_SET, offsets, NULL, counts, NULL);
 
-		counts[0] = fields[ifield]->ny; counts[1] = fields[ifield]->nx;
+		counts[0] = mstate->fields[ifield]->ny; counts[1] = mstate->fields[ifield]->nx;
 		memspace = H5Screate_simple(2, counts, NULL);
-		counts[0] = fields[ifield]->ny-2; counts[1] = fields[ifield]->nx-2;
+		counts[0] = mstate->fields[ifield]->ny-2; counts[1] = mstate->fields[ifield]->nx-2;
 		offsets[0] = 1; offsets[1] = 1;
 		H5Sselect_hyperslab(memspace, H5S_SELECT_SET, offsets, NULL, counts, NULL);
 
-		H5Dwrite(dset_id, C_H5_REAL, memspace, filespace, plist_id, fields[ifield]->f);  // status =
+		H5Dwrite(dset_id, C_H5_REAL, memspace, filespace, plist_id, mstate->fields[ifield]->f);  // status =
 
 		H5Dclose(dset_id);
 		H5Sclose(filespace);
@@ -345,19 +290,19 @@ void writeFields(int nfields, struct field **fields,
 		H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
 	H5Sclose(filespace);
 
-	offsets[0] = gridy->oy+1; counts[0] = gridy->ny-2;
+	offsets[0] = mstate->grids[IY]->oy+1; counts[0] = mstate->grids[IY]->ny-2;
 	filespace = H5Dget_space(dset_id);
 	H5Sselect_hyperslab(filespace, H5S_SELECT_SET, offsets, NULL, counts, NULL);
 
-	counts[0] = gridy->ny;
+	counts[0] = mstate->grids[IY]->ny;
 	memspace = H5Screate_simple(1, counts, NULL);
-	counts[0] = gridy->ny-2; offsets[0] = 1;
+	counts[0] = mstate->grids[IY]->ny-2; offsets[0] = 1;
 	H5Sselect_hyperslab(memspace, H5S_SELECT_SET, offsets, NULL, counts, NULL);
 
 	plist_id = H5Pcreate(H5P_DATASET_XFER);
 	H5Pset_dxpl_mpio(plist_id, H5FD_MPIO_COLLECTIVE);
 
-	H5Dwrite(dset_id, C_H5_REAL, memspace, filespace, plist_id, gridy->f);  // status =
+	H5Dwrite(dset_id, C_H5_REAL, memspace, filespace, plist_id, mstate->grids[IY]->f);  // status =
 
 	H5Dclose(dset_id);
 	H5Sclose(filespace);
@@ -371,19 +316,19 @@ void writeFields(int nfields, struct field **fields,
 		H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
 	H5Sclose(filespace);
 
-	offsets[0] = gridx->ox+1; counts[0] = gridx->nx-2;
+	offsets[0] = mstate->grids[IX]->ox+1; counts[0] = mstate->grids[IX]->nx-2;
 	filespace = H5Dget_space(dset_id);
 	H5Sselect_hyperslab(filespace, H5S_SELECT_SET, offsets, NULL, counts, NULL);
 
-	counts[0] = gridx->nx;
+	counts[0] = mstate->grids[IX]->nx;
 	memspace = H5Screate_simple(1, counts, NULL);
-	counts[0] = gridx->nx-2; offsets[0] = 1;
+	counts[0] = mstate->grids[IX]->nx-2; offsets[0] = 1;
 	H5Sselect_hyperslab(memspace, H5S_SELECT_SET, offsets, NULL, counts, NULL);
 
 	plist_id = H5Pcreate(H5P_DATASET_XFER);
 	H5Pset_dxpl_mpio(plist_id, H5FD_MPIO_COLLECTIVE);
 
-	H5Dwrite(dset_id, C_H5_REAL, memspace, filespace, plist_id, gridx->f); // status = 
+	H5Dwrite(dset_id, C_H5_REAL, memspace, filespace, plist_id, mstate->grids[IX]->f); // status = 
 
 	H5Dclose(dset_id);
 	H5Sclose(filespace);
@@ -483,6 +428,8 @@ void readConfig(struct config *globalConfig, const char *configfile) {
 }
 
 
+
+
 /* MAIN PROGRAM */
 
 int main(int argc, char **argv) {
@@ -494,11 +441,11 @@ int main(int argc, char **argv) {
 	int iproc, nproc, ierr;
 
 	struct config globalConfig;
+	struct modeldata mstate;
 
 	struct field T, Told;
 	struct field Kdiff;
 	struct field globalGridx, globalGridy, gridx, gridy;
-	struct field **allFields;
 
 	Real dy, dx;
 
@@ -540,8 +487,6 @@ int main(int argc, char **argv) {
 	MPI_Cart_create(MPI_COMM_WORLD, mpistate.mpicomm_ndims, mpistate.mpicomm_dims, mpistate.mpicomm_periods, mpistate.mpicomm_reorder, &mpistate.comm2d);
 	MPI_Cart_get(mpistate.comm2d, mpistate.mpicomm_ndims, mpistate.mpicomm_dims, mpistate.mpicomm_periods, mpistate.mpicoord);
 
-
-	
 	
 	
 	/* init grids */
@@ -566,6 +511,14 @@ int main(int argc, char **argv) {
 	for (int i = 0; i < gridy.ny; i++) gridy.f[i] = (i + gridy.oy)*dy;
 	for (int j = 0; j < gridx.nx; j++) gridx.f[j] = (j + gridx.ox)*dx;
 
+	mstate.grids = malloc(sizeof(struct field *)*2);
+	mstate.grids[IX] = &gridx;
+	mstate.grids[IY] = &gridy;
+
+	mstate.globalGrids = malloc(sizeof(struct field *)*2);
+	mstate.globalGrids[IX] = &globalGridx;
+	mstate.globalGrids[IY] = &globalGridy;
+
 	
 	
 	/* initialize fields */
@@ -581,11 +534,13 @@ int main(int argc, char **argv) {
 	Kdiff.f = calloc(sizeof(Real), Kdiff.nx*Kdiff.ny);
 	nameField(&Kdiff, "Kdiff");
 
-
-	allFields = malloc(sizeof(struct field *) * 3);
-	allFields[0] = &T;
-	allFields[1] = &Told;
-	allFields[2] = &Kdiff;
+	mstate.time = 0.0;
+	mstate.timestep = 0;
+	mstate.nfields = 3;
+	mstate.fields = malloc(sizeof(struct field *) * 3);
+	mstate.fields[0] = &T;
+	mstate.fields[1] = &Told;
+	mstate.fields[2] = &Kdiff;
 
 
 	readHdf5(&T, &mpistate, globalConfig.initfile);
@@ -688,7 +643,7 @@ int main(int argc, char **argv) {
 
 	}
 
-	writeFields(3, allFields, &gridy, &gridx, &mpistate, &globalConfig);
+	writeFields(&mstate, &mpistate, &globalConfig);
 
 	MPI_Finalize();
 
