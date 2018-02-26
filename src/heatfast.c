@@ -25,6 +25,8 @@ int main(int argc, char **argv) {
 
 	Real dy, dx;
 
+	double tick, tock;
+
 
 	/* inits */
 	MPI_Init(&argc, &argv);
@@ -98,6 +100,7 @@ int main(int argc, char **argv) {
 	
 	
 	/* initialize fields */
+	if (iproc == 0) fprintf(stdout, "Allocating memory for fields\n");
 	T.nx = gridx.nx; T.ny = gridy.ny; 
 	T.ox = gridx.ox; T.oy = gridy.oy;
 	T.f = calloc(sizeof(Real), T.nx*T.ny);
@@ -119,18 +122,22 @@ int main(int argc, char **argv) {
 	mstate.fields[2] = &Kdiff;
 
 
+	if (iproc == 0) fprintf(stdout, "Reading initial fields from HDF5\n");
 	readHdf5(&T, &mpistate, globalConfig.initfile);
 	readHdf5(&Kdiff, &mpistate, globalConfig.initfile);
 
 	communicateHalos(&mpistate, &T);
 	communicateHalos(&mpistate, &Kdiff);
 
+	tick = MPI_Wtime();
 
 	for (int iter = 0; iter < globalConfig.niter; iter++) {
 		Real dtlocal, dtglobal, maxK;
 		maxK = 0.0;
 
 		if (iproc == 0) fprintf(stdout, "Iter %d\n", iter);
+
+		//if (iproc == 0) fprintf(stdout, "Iter %d\n", iter);
 		/* take a time step */
 		swapFields(&T, &Told);
 		
@@ -161,10 +168,15 @@ int main(int argc, char **argv) {
 
 		if (mpistate.mpicoord[IX] == 0) {
 			// i have (part of) the left bnd
-			if (globalConfig.bctypes[2] == 1) {
+			if (globalConfig.bctypes[BND_X0] & BC_TYPE_DIRICHLET) {
 				int j = 1;
 				for (int i = 0; i < T.ny; i++) {
 					T.f[i*T.nx + j] = globalConfig.bcvalues[2];
+				}
+			} else if (globalConfig.bctypes[BND_X0] & BC_TYPE_NEUMANN) {
+				int j = 1;
+				for (int i = 0; i < T.ny; i++) {
+					T.f[i*T.nx + j] = T.f[i*T.nx + j+1];
 				}
 			} else {
 				fprintf(stderr, "Unrecognized BC type for boundary x0\n");
@@ -174,10 +186,15 @@ int main(int argc, char **argv) {
 		} 
 		if (mpistate.mpicoord[IX] == globalConfig.px-1) {
 			// i have (part of) the right bnd bnd
-			if (globalConfig.bctypes[3] == 1) {
+			if (globalConfig.bctypes[BND_X1] & BC_TYPE_DIRICHLET) {
 				int j = T.nx-2;
 				for (int i = 0; i < T.ny; i++) {
 					T.f[i*T.nx + j] = globalConfig.bcvalues[3];
+				}
+			} else if (globalConfig.bctypes[BND_X1] & BC_TYPE_NEUMANN) {
+				int j = T.nx-2;
+				for (int i = 0; i < T.ny; i++) {
+					T.f[i*T.nx + j] = T.f[i*T.nx + j-1];
 				}
 			} else {
 				fprintf(stderr, "Unrecognized BC type for boundary x1\n");
@@ -188,10 +205,15 @@ int main(int argc, char **argv) {
 
 		if (mpistate.mpicoord[IY] == 0) {
 			// i have (part of) the upper bnd
-			if (globalConfig.bctypes[0] == 1) {
+			if (globalConfig.bctypes[BND_Y0] & BC_TYPE_DIRICHLET) {
 				int i = 1;
 				for (int j = 0; j < T.nx; j++) {
 					T.f[i*T.nx + j] = globalConfig.bcvalues[0];
+				}
+			} else if (globalConfig.bctypes[BND_Y0] & BC_TYPE_NEUMANN) {
+				int i = 1;
+				for (int j = 0; j < T.nx; j++) {
+					T.f[i*T.nx + j] = T.f[(i+1)*T.nx + j];
 				}
 			} else {
 				fprintf(stderr, "Unrecognized BC type for boundary y0\n");
@@ -201,10 +223,15 @@ int main(int argc, char **argv) {
 		}
 		if (mpistate.mpicoord[IY] == globalConfig.py-1) {
 			// i have (part of) the lower bnd bnd
-			if (globalConfig.bctypes[1] == 1) {
+			if (globalConfig.bctypes[BND_Y1] & BC_TYPE_DIRICHLET) {
 				int i = T.ny-2;
 				for (int j = 0; j < T.nx; j++) {
 					T.f[i*T.nx + j] = globalConfig.bcvalues[1];
+				}
+			} else if (globalConfig.bctypes[BND_Y1] & BC_TYPE_NEUMANN) {
+				int i = 1;
+				for (int j = 0; j < T.nx; j++) {
+					T.f[i*T.nx + j] = T.f[(i-1)*T.nx + j];
 				}
 			} else {
 				fprintf(stderr, "Unrecognized BC type for boundary y1\n");
@@ -218,6 +245,10 @@ int main(int argc, char **argv) {
 		communicateHalos(&mpistate, &Kdiff);
 
 	}
+
+	tock = MPI_Wtime();
+
+	if (iproc == 0) fprintf(stdout, "*** %d iters took %g sec\n", globalConfig.niter, tock-tick);
 
 	writeFields(&mstate, &mpistate, &globalConfig);
 

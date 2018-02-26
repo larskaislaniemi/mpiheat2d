@@ -18,6 +18,14 @@ typedef double Real;               // NB! libconfig currently support double, no
 #define C_MPI_REAL MPI_DOUBLE
 #define C_H5_REAL H5T_NATIVE_DOUBLE
 
+#define BC_TYPE_DIRICHLET 1
+#define BC_TYPE_NEUMANN 2
+
+#define BND_Y0 0
+#define BND_Y1 1
+#define BND_X0 2
+#define BND_X1 3
+
 #define MIN(X, Y) (((X) < (Y)) ? (X) : (Y))
 
 
