@@ -17,6 +17,9 @@ numdatatype = "float64"    # change to float32 for float in heatfast.c
 
 ###############################
 
+class WrongArgumentException(Exception):
+    pass
+
 
 def getValue(modelname, field, x, y, Lx, Ly):
     if modelname == "simplegradient":
@@ -56,15 +59,15 @@ elif modelname == "variedk":
     idxw = np.where(y[:,0] < 0.5*Ly)
     idx = (np.amin(idxw), np.amax(idxw))
     print(idx)
-    dset_Kdiff[idx[0]:idx[1],:] = 1e-6
+    dset_Kdiff[idx[0]:idx[1]+1,:] = 1e-6
 
     idxw = np.where(y[:,0] >= 0.5*Ly)
     idx = (np.amin(idxw), np.amax(idxw))
     print(idx)
-    dset_Kdiff[idx[0]:idx[1],:] = 1e-6
+    dset_Kdiff[idx[0]:idx[1]+1,:] = 4e-6
 
 else:
-    raise Exception("No such model")
+    raise WrongArgumentException("No such model")
 
 
 #print("Start")
