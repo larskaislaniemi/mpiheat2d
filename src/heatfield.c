@@ -20,19 +20,23 @@ void communicateHalos(struct mpidata *mpistate, struct field *fld) {
 	for (int i = 0; i < 4; i++) if (mpistate->rank_neighb[i] < 0) mpistate->rank_neighb[i] = MPI_PROC_NULL;
 
 	// send lower and upper row
-	MPI_Sendrecv(&fld->f[fld->nx*(fld->ny-2)], fld->nx, C_MPI_REAL, mpistate->rank_neighb[1], 0, 
-			&fld->f[0], fld->nx, C_MPI_REAL, mpistate->rank_neighb[0], 0, mpistate->comm2d, MPI_STATUS_IGNORE);
-	MPI_Sendrecv(&fld->f[fld->nx*1], fld->nx, C_MPI_REAL, mpistate->rank_neighb[0], 0, 
-			&fld->f[fld->nx*(fld->ny-1)], fld->nx, C_MPI_REAL, mpistate->rank_neighb[1], 0, mpistate->comm2d, MPI_STATUS_IGNORE);
+	if (fld->ny > 1) {
+		MPI_Sendrecv(&fld->f[fld->nx*(fld->ny-2)], fld->nx, C_MPI_REAL, mpistate->rank_neighb[1], 0, 
+				&fld->f[0], fld->nx, C_MPI_REAL, mpistate->rank_neighb[0], 0, mpistate->comm2d, MPI_STATUS_IGNORE);
+		MPI_Sendrecv(&fld->f[fld->nx*1], fld->nx, C_MPI_REAL, mpistate->rank_neighb[0], 0, 
+				&fld->f[fld->nx*(fld->ny-1)], fld->nx, C_MPI_REAL, mpistate->rank_neighb[1], 0, mpistate->comm2d, MPI_STATUS_IGNORE);
+	}
 
 	// send right and left column
-	MPI_Type_vector(fld->ny, 1, fld->nx, C_MPI_REAL, &columntype);
-	MPI_Type_commit(&columntype);
-	MPI_Sendrecv(&fld->f[fld->nx-2], 1, columntype, mpistate->rank_neighb[3], 0, 
-			&fld->f[0], 1, columntype, mpistate->rank_neighb[2], 0, mpistate->comm2d, MPI_STATUS_IGNORE);
-	MPI_Sendrecv(&fld->f[1], 1, columntype, mpistate->rank_neighb[2], 0, 
-			&fld->f[fld->nx-1], 1, columntype, mpistate->rank_neighb[3], 0, mpistate->comm2d, MPI_STATUS_IGNORE);
-	MPI_Type_free(&columntype);
+	if (fld->nx > 1) {
+		MPI_Type_vector(fld->ny, 1, fld->nx, C_MPI_REAL, &columntype);
+		MPI_Type_commit(&columntype);
+		MPI_Sendrecv(&fld->f[fld->nx-2], 1, columntype, mpistate->rank_neighb[3], 0, 
+				&fld->f[0], 1, columntype, mpistate->rank_neighb[2], 0, mpistate->comm2d, MPI_STATUS_IGNORE);
+		MPI_Sendrecv(&fld->f[1], 1, columntype, mpistate->rank_neighb[2], 0, 
+				&fld->f[fld->nx-1], 1, columntype, mpistate->rank_neighb[3], 0, mpistate->comm2d, MPI_STATUS_IGNORE);
+		MPI_Type_free(&columntype);
+	}
 }
 
 

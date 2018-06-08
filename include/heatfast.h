@@ -13,6 +13,7 @@
 #define ERR_INTERNAL 65536
 
 #define STR_MAXLEN 255
+#define NSURFACE_MAX 5
 
 typedef double Real;               // NB! libconfig currently support double, not float
 #define C_MPI_REAL MPI_DOUBLE
@@ -49,6 +50,7 @@ struct config {
 	char initfile[STR_MAXLEN];      // where from to read initial conditions
 	int bctypes[4];       // boundary condition types
 	Real bcvalues[4];     // boundary condition values
+	int nsurfaces;        // number of surfaces
 };
 
 
@@ -67,6 +69,8 @@ struct modeldata {
 	struct field **fields;          // pointers to variable fields
 	struct field **grids;           // pointers to local grids 
 	struct field **globalGrids;     // pointers to global grids
+	struct field * surfaces[NSURFACE_MAX];
+	                                // pointers to surfaces
 };
 
 

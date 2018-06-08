@@ -35,6 +35,13 @@ def getValue(modelname, field, x, y, Lx, Ly):
                 return 1e-6
             else:
                 return 4e-6
+    elif modelname == "surfacetest":
+        if field == "T":
+            return 0.0
+        elif field == "Kdiff":
+            return 1e-6
+        elif field == "surface_0":
+            return 0.5*Ly;
     else:
         raise Exception("No such model")
 
@@ -49,6 +56,9 @@ f = h5py.File('init.h5', 'w')
 
 dset_T     = f.create_dataset("T",     shape=(ny, nx), dtype=numdatatype)
 dset_Kdiff = f.create_dataset("Kdiff", shape=(ny, nx), dtype=numdatatype)
+
+dset_surfaces = []
+nsurfaces = 0
 
 if modelname == "simplegradient":
     dset_T[:,:] = 500.0 * y / Ly
@@ -65,7 +75,14 @@ elif modelname == "variedk":
     idx = (np.amin(idxw), np.amax(idxw))
     print(idx)
     dset_Kdiff[idx[0]:idx[1]+1,:] = 4e-6
+elif modelname == "surfacetest":
+    nsurfaces = 1
+    dset_surfaces.append(f.create_dataset("surface_0", shape=(1, nx), dtype=numdatatype))
 
+    dset_T[:,:] = 1300.0
+    dset_Kdiff[:,:] = 1e-6
+    dset_surfaces[0][0,:] = 0.5*Ly
+    #dset_surfaces[0][0,x[0,:] > 0.5*Lx] = 0.6*Ly
 else:
     raise WrongArgumentException("No such model")
 

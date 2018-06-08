@@ -8,15 +8,24 @@
 
 
 void readHdf5(struct field *fld, struct mpidata *mpistate, char *filename) {
-
 	hid_t plist_id, dset_id, filespace, memspace, file_id;
 	hsize_t counts[2], offsets[2];
 	char fieldpath[STR_MAXLEN];
 	snprintf(fieldpath, STR_MAXLEN, "/%s", fld->name);
 
 	plist_id = H5Pcreate(H5P_FILE_ACCESS);
-	H5Pset_fapl_mpio(plist_id, mpistate->comm2d, MPI_INFO_NULL);
-	file_id = H5Fopen(filename, H5F_ACC_RDONLY, plist_id);
+	if (plist_id < -1) {
+		fprintf(stderr, "readHdf5(): H5Pcreate() failed\n");
+		MPI_Abort(MPI_COMM_WORLD, ERR_INTERNAL);
+		exit(ERR_INTERNAL);
+	}
+	if (H5Pset_fapl_mpio(plist_id, mpistate->comm2d, MPI_INFO_NULL) < 0) {
+		fprintf(stderr, "readHdf5(): H5Pset_fapl_mpio() failed\n");
+		MPI_Abort(MPI_COMM_WORLD, ERR_INTERNAL);
+		exit(ERR_INTERNAL);
+	}
+	file_id = H5Fopen(filename, H5F_ACC_RDONLY, plist_id); 
+
 	if (file_id < 0) {
 		fprintf(stderr, "readHdf5(): Cannot open file %s\n", filename);
 		MPI_Abort(MPI_COMM_WORLD, ERR_FILEOPER);
@@ -26,15 +35,44 @@ void readHdf5(struct field *fld, struct mpidata *mpistate, char *filename) {
 
 	dset_id = H5Dopen(file_id, fieldpath, H5P_DEFAULT);
 
-	offsets[0] = fld->oy+1; offsets[1] = fld->ox+1;
-	counts[0] = fld->ny-2; counts[1] = fld->nx-2;
+	/* If field is one-dimensional, all processes in shortest
+	 * dimension will read in the values */
+	if (fld->ny == 1) {
+		offsets[0] = 0;
+		counts[0] = 1;
+	} else {
+		offsets[0] = fld->oy+1; 
+		counts[0] = fld->ny-2;
+	}
+	
+	if (fld->nx == 1) {
+		offsets[1] = 0;
+		counts[1] = 1;
+	} else {
+		offsets[1] = fld->ox+1;
+		counts[1] = fld->nx-2;
+	}
+	
 	filespace = H5Dget_space(dset_id);
 	H5Sselect_hyperslab(filespace, H5S_SELECT_SET, offsets, NULL, counts, NULL);
-
 	counts[0] = fld->ny; counts[1] = fld->nx;
 	memspace = H5Screate_simple(2, counts, NULL);
-	counts[0] = fld->ny-2; counts[1] = fld->nx-2;
-	offsets[0] = 1; offsets[1] = 1;
+
+	if (fld->ny == 1) {
+		offsets[0] = 0;
+		counts[0] = 1;
+	} else {
+		offsets[0] = 1;
+		counts[0] = fld->ny-2;
+	}
+	
+	if (fld->nx == 1) {
+		offsets[1] = 0;
+		counts[1] = 1;
+	} else {
+		offsets[1] = 1;
+		counts[1] = fld->nx-2;
+	}
 	H5Sselect_hyperslab(memspace, H5S_SELECT_SET, offsets, NULL, counts, NULL);
 	H5Dread(dset_id, C_H5_REAL, memspace, filespace, H5P_DEFAULT, fld->f);
 
@@ -212,6 +250,7 @@ void readConfig(struct config *globalConfig, const char *configfile) {
 		strncpy(globalConfig->initfile, tmpstring, STR_MAXLEN);
 		globalConfig->initfile[STR_MAXLEN-1] = '\0';
 		if (config_lookup_int(&inputcfg, "run.iter", &globalConfig->niter) != CONFIG_TRUE) { fprintf(stderr, "config option run.iter needed but not found\n"); MPI_Abort(MPI_COMM_WORLD, ERR_CFGFILE); exit(ERR_CFGFILE); }
+		if (config_lookup_int(&inputcfg, "surfaces.nsurfaces", &globalConfig->nsurfaces) != CONFIG_TRUE) { fprintf(stderr, "config option surfaces.nsurfaces needed but not found\n"); MPI_Abort(MPI_COMM_WORLD, ERR_CFGFILE); exit(ERR_CFGFILE); }
 
 		bctypes = config_lookup(&inputcfg, "bccond.types");
 		if (bctypes == NULL || config_setting_is_array(bctypes) != CONFIG_TRUE) { fprintf(stderr, "config option bccond.types needed but not found or wrong type\n"); MPI_Abort(MPI_COMM_WORLD, ERR_CFGFILE); exit(ERR_CFGFILE); }
